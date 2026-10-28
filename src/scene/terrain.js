@@ -84,7 +84,7 @@ const ROUGH = /* glsl */`
 const CAUSTICS = /* glsl */`
   if (wdepth > 0.0) {
     vec3 rs = refract(-uSunDirT, vec3(0.0, 1.0, 0.0), 0.75);
-    vec2 base = vWPos.xz - rs.xz / rs.y * wdepth;
+    vec2 base = vWPos.xz + rs.xz / rs.y * wdepth;   // where this light entered the surface
     float c1 = texture(uCaustics, base * 0.19 + uTimeT * vec2(0.021, 0.013)).r;
     float c2 = texture(uCaustics, base * 0.23 + vec2(0.37, 0.71) - uTimeT * vec2(0.017, 0.023)).r;
     float c = min(c1, c2) * 2.5;
@@ -99,8 +99,11 @@ const FOG = /* glsl */`
   outgoingLight = mix(outgoingLight, textureLod(uSkyCube, vec3(fdir.x, max(fdir.y, 0.0), fdir.z), 3.0).rgb, fogAmt);
 `;
 
-function patch(material, uniforms, isRock) {
-  material.defines = isRock ? { ROCK: '' } : {};
+// mode: 'terrain' | 'rock' | 'prop' (props keep their own colours, just get the
+// underwater light falloff, caustics and fog)
+function patch(material, uniforms, mode) {
+  const ground = mode !== 'prop';
+  if (mode === 'rock') material.defines = { ...material.defines, ROCK: '' };
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = shader.vertexShader
@@ -118,13 +121,13 @@ function patch(material, uniforms, isRock) {
   vWNrm = normalize(mat3(modelMatrix) * wn);`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', '#include <common>\n' + FRAG_PARS)
-      .replace('#include <map_fragment>', '#include <map_fragment>\n' + ALBEDO + UNDERWATER)
-      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n' + ROUGH)
-      .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n' + RIPPLES)
+      .replace('#include <map_fragment>', '#include <map_fragment>\n' + (ground ? ALBEDO : '') + UNDERWATER)
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n' + (ground ? ROUGH : ''))
+      .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n' + (ground ? RIPPLES : ''))
       .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + CAUSTICS)
       .replace('#include <opaque_fragment>', FOG + '#include <opaque_fragment>');
   };
-  material.customProgramCacheKey = () => (isRock ? 'gelatin-rock' : 'gelatin-terrain');
+  material.customProgramCacheKey = () => 'gelatin-' + mode;
 }
 
 function rockGeometry() {
@@ -181,7 +184,7 @@ export function createTerrain({ sky, caustics, absorption, reflectionLayer = 1 }
 
   const { geometry } = buildTerrain(384);
   const groundMat = new THREE.MeshStandardMaterial({ roughness: 0.92, metalness: 0, envMapIntensity: 0.9 });
-  patch(groundMat, uniforms, false);
+  patch(groundMat, uniforms, 'terrain');
   const ground = new THREE.Mesh(geometry, groundMat);
   ground.castShadow = ground.receiveShadow = true;
 
@@ -189,7 +192,7 @@ export function createTerrain({ sky, caustics, absorption, reflectionLayer = 1 }
   const rand = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
   const spots = placeRocks(90, rand);
   const rockMat = new THREE.MeshStandardMaterial({ roughness: 0.85, metalness: 0, envMapIntensity: 0.9 });
-  patch(rockMat, uniforms, true);
+  patch(rockMat, uniforms, 'rock');
   const rocks = new THREE.InstancedMesh(rockGeometry(), rockMat, spots.length);
   const m = new THREE.Matrix4(), qt = new THREE.Quaternion(), e = new THREE.Euler(), sc = new THREE.Vector3();
   spots.forEach((s, i) => {
@@ -204,5 +207,5 @@ export function createTerrain({ sky, caustics, absorption, reflectionLayer = 1 }
   const group = new THREE.Group();
   group.add(ground, rocks);
   for (const o of [ground, rocks]) o.layers.enable(reflectionLayer);
-  return { group, uniforms };
+  return { group, uniforms, patchProp: (m) => patch(m, uniforms, 'prop') };
 }

@@ -37,7 +37,9 @@ function buildGrid() {
   return geo;
 }
 
-const SHARED = /* glsl */`
+// Shared by the surface, the CPU height queries and the underwater pass, so every
+// consumer sees exactly the same surface.
+export const WATER_GLSL = /* glsl */`
 #define N_TEX ${N.toFixed(1)}
 #define PI 3.14159265359
 uniform sampler2D uDisp0, uDisp1, uDisp2;
@@ -120,9 +122,28 @@ Shore shoreWaves(vec2 xz, vec4 sh) {
   }
   return o;
 }
+
+// Full surface displacement at an undisplaced xz; lod per cascade (0 = finest).
+vec3 waterDisplacement(vec2 xz, vec3 lod) {
+  vec4 sh = shoreSample(xz);
+  vec3 damp = cascadeDamp(-sh.x);
+  vec3 d = textureLod(uDisp0, xz / uLength.x, max(lod.x, 0.0)).xyz * damp.x
+         + textureLod(uDisp1, xz / uLength.y, max(lod.y, 0.0)).xyz * damp.y
+         + textureLod(uDisp2, xz / uLength.z, max(lod.z, 0.0)).xyz * damp.z;
+  return d + shoreWaves(xz, sh).disp;
+}
+
+// Surface at world xz: invert the choppy horizontal displacement by fixed-point
+// iteration, then read the height there. Returns the displacement; .y is the height.
+vec3 waterAt(vec2 q, vec3 lod) {
+  vec2 p = q;
+  vec3 d = vec3(0.0);
+  for (int i = 0; i < 4; i++) { d = waterDisplacement(p, lod); p = q - d.xz; }
+  return waterDisplacement(p, lod);
+}
 `;
 
-const VERT = SHARED + /* glsl */`
+const VERT = WATER_GLSL + /* glsl */`
 uniform float uGridScale;
 uniform float uCellStep;
 out vec3 vWorld;
@@ -135,21 +156,15 @@ void main() {
   vec2 xz = cameraPosition.xz + local * scale;
   float cell = max(r, ${INNER.toFixed(1)}) * uCellStep * scale;
 
-  vec4 sh = shoreSample(xz);
-  vec3 damp = cascadeDamp(-sh.x);
   // +1 LOD bias: box-filtered mips still leak a little past Nyquist
-  vec3 lod = log2(cell * N_TEX / uLength) + 1.0;
-  vec3 d = textureLod(uDisp0, xz / uLength.x, max(lod.x, 0.0)).xyz * damp.x
-         + textureLod(uDisp1, xz / uLength.y, max(lod.y, 0.0)).xyz * damp.y
-         + textureLod(uDisp2, xz / uLength.z, max(lod.z, 0.0)).xyz * damp.z;
-  d += shoreWaves(xz, sh).disp;
+  vec3 d = waterDisplacement(xz, log2(cell * N_TEX / uLength) + 1.0);
 
   vXZ = xz;
   vWorld = vec3(xz.x + d.x, d.y, xz.y + d.z);
   gl_Position = projectionMatrix * viewMatrix * vec4(vWorld, 1.0);
 }`;
 
-const FRAG = SHARED + /* glsl */`
+const FRAG = WATER_GLSL + /* glsl */`
 precision highp sampler2DShadow;
 uniform vec2 uResolution;
 uniform vec2 uNearFar;
@@ -173,6 +188,7 @@ uniform vec4 uOptics;       // base roughness, refraction strength, reflection d
 uniform vec3 uCamForward;
 uniform int uDebug;
 uniform float uGlint;
+uniform float uCamSide;     // -1 camera above the surface, 1 below, 0 straddling it
 in vec3 vWorld;
 in vec2 vXZ;
 out vec4 fragColor;
@@ -197,6 +213,8 @@ vec3 skyLod(vec3 dir, float lod) {
 }
 
 void main() {
+  // folded crests flip triangles; drop faces that can't face the camera's side
+  if (gl_FrontFacing ? uCamSide > 0.5 : uCamSide < -0.5) discard;
   vec3 toCam = cameraPosition - vWorld;
   float dist = length(toCam);
   vec3 V = toCam / dist;
@@ -229,6 +247,31 @@ void main() {
   float t0 = texture(uDisp0, vXZ / uLength.x).w, t1 = texture(uDisp1, vXZ / uLength.y).w, t2 = texture(uDisp2, vXZ / uLength.z).w;
   float jac = mix(1.0, t0, damp.x) + mix(1.0, t1, damp.y) + mix(1.0, t2, damp.z) - 2.0;
   float foam = clamp((uFoam.x - jac) * uFoam.y, 0.0, 1.0);
+
+  // --- seen from below: Snell's window + total internal reflection ---------------
+  // (the camera->surface water column is fogged later by the underwater pass)
+  if (!gl_FrontFacing) {
+    vec3 Nu = -Nrm;
+    vec3 Tdir = refract(-V, Nu, 1.33);
+    vec3 ambientU = skyLod(vec3(0.0, 1.0, 0.0), uSkyMaxLod);
+    vec3 below = uScatterColor * (ambientU + uSunColor * max(uSunDir.y, 0.0));
+    vec3 colU = below;
+    if (dot(Tdir, Tdir) > 0.0) {
+      float cosT = max(dot(Tdir, Nrm), 0.0);
+      float Fu = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
+      // sky through the window is the refracted direction (the 180-degree sky squeezed
+      // into the ~97-degree cone); anything opaque above water comes from the frame
+      vec2 wuv = uv + Nrm.xz * 0.04;
+      vec3 above = textureLod(uSceneDepth, wuv, 0.0).r > 0.999999 ? skyLod(Tdir, 0.0) : textureLod(uSceneColor, wuv, 0.0).rgb;
+      // sun seen through the window, smeared by the ripples
+      float sunLobe = pow(max(dot(Tdir, uSunDir), 0.0), 600.0) * 40.0;
+      colU = mix(above + uSunColor * sunLobe * shadow, below, Fu);
+    }
+    colU *= 1.0 - 0.55 * max(foam, clamp(shore.foam, 0.0, 1.0));
+    // alpha tags what the pixel sees for the underwater pass: 0 underside, 0.5 top
+    fragColor = vec4(colU, 0.0);
+    return;
+  }
 
   // --- refraction + absorption -------------------------------------------------
   float waterDepth = linearDepth(gl_FragCoord.z);
@@ -330,7 +373,7 @@ void main() {
   else if (uDebug == 5) col = vec3(F);
   else if (uDebug == 6) col = body;
   else if (uDebug == 7) col = refl;
-  fragColor = vec4(col, 1.0);
+  fragColor = vec4(col, 0.5);
 }`;
 
 export class OceanSurface {
@@ -370,12 +413,14 @@ export class OceanSurface {
       uCamForward: { value: new THREE.Vector3() },
       uDebug: { value: 0 },
       uGlint: { value: 0.6 },
+      uCamSide: { value: -1 },
     };
     this.material = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
       vertexShader: VERT,
       fragmentShader: FRAG,
       uniforms: this.uniforms,
+      side: THREE.DoubleSide,
     });
     this.mesh = new THREE.Mesh(buildGrid(), this.material);
     this.mesh.frustumCulled = false;

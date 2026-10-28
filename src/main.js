@@ -12,6 +12,10 @@ import { PlanarReflection } from './engine/PlanarReflection.js';
 import { PostFX } from './engine/PostFX.js';
 import { GpuTimer } from './engine/gpuTimer.js';
 import { FullscreenQuad, rawPass } from './engine/fullscreen.js';
+import { WaterQuery } from './water/WaterQuery.js';
+import { UnderwaterPass } from './water/UnderwaterPass.js';
+import { Floaters } from './scene/floaters.js';
+import { FLOATER_KINDS } from './scene/floaterMeshes.js';
 
 const REFLECT_LAYER = 1;
 
@@ -56,6 +60,12 @@ scene.add(sunLight, sunLight.target);
 surface.uniforms.uShadowMatrix.value = sunLight.shadow.matrix;
 surface.uniforms.uShadowTexel.value.set(1 / 4096, 1 / 4096);
 
+// buoyancy: slot 0 of every water query is the camera (underwater test), then floaters
+const query = new WaterQuery(renderer, surface, 512);
+const floaters = new Floaters({ scene, heightAt: islandHeight, patchMaterial: terrain.patchProp });
+const underwater = new UnderwaterPass(surface, camera, tex.caustics);
+let camWater = 0, uwGain = 1;
+
 const reflection = new PlanarReflection(REFLECT_LAYER);
 surface.uniforms.uReflMatrix.value = reflection.textureMatrix;
 const emptyReflection = new THREE.DataTexture(new Uint8Array(4), 1, 1);
@@ -76,7 +86,8 @@ waterScene.add(restore.mesh, surface.mesh);
 const post = new PostFX(renderer);
 post.params.bloomStrength = 0.05;
 post.params.bloomThreshold = 1.5;
-const look = { exposure: 0.55 };
+const look = { exposure: 0.55, underwater: 3 };
+let exposureBase = 1;
 
 let hdrRT = null;
 function makeTargets() {
@@ -93,6 +104,7 @@ function makeTargets() {
   reflection.scale = quality.reflectionScale;
   reflection.setSize(size.x, size.y);
   post.setSize(size.x, size.y);
+  underwater.setSize(size.x, size.y);
 }
 
 function resize() {
@@ -119,7 +131,7 @@ function applySun() {
 function updateExposure() {
   const c = sky.sunColor, lum = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
   const E = Math.PI * Math.max(lum, 0.05) * (Math.max(sky.sunDir.y, 0) + 0.25);
-  post.params.exposure = look.exposure * 2.2 / Math.pow(E, 0.85);
+  exposureBase = look.exposure * 2.2 / Math.pow(E, 0.85);
 }
 
 // --- camera presets -----------------------------------------------------------------
@@ -164,6 +176,25 @@ const views = {
     setSun(30, 205);
     camera.position.set(900, 420, 900);
     controls.target.set(0, 0, 0);
+  },
+  'Flotsam': () => {
+    setSun(26, 205);
+    const b = sunBearing() + 1.2, c = coast(THREE.MathUtils.radToDeg(b));
+    const out = new THREE.Vector2(Math.cos(b), Math.sin(b)), side = new THREE.Vector2(-out.y, out.x);
+    camera.position.set(c.x + out.x * 75 + side.x * 10, 4.5, c.y + out.y * 75 + side.y * 10);
+    controls.target.set(c.x + out.x * 45 - side.x * 15, 0, c.y + out.y * 45 - side.y * 15);
+    floaters.spawn(camera.position, controls.target.clone().sub(camera.position));
+  },
+  'Underwater': () => {
+    setSun(48, 205);
+    // on the lee of the island, looking back up the reef slope into the sun (shafts)
+    const a = sunBearing() + Math.PI + 0.3;
+    let r = 200;
+    while (r < 1000 && islandHeight(Math.cos(a) * r, Math.sin(a) * r) > -9) r += 2;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    camera.position.set(x, -3.2, z);
+    controls.target.set(x - Math.cos(a) * 25, -1.8, z - Math.sin(a) * 25);
+    floaters.spawn(camera.position, controls.target.clone().sub(camera.position));
   },
 };
 
@@ -235,6 +266,28 @@ fWater.add(w, 'shoreFoamBand', 0, 2, 0.01).onChange(setWater);
 fWater.add(w, 'caustics', 0, 8, 0.01).onChange(setWater);
 fWater.add(su.uGlint, 'value', 0, 1, 0.01).name('glitter');
 
+const fFloat = gui.addFolder('Floaters & underwater');
+const ahead = (d) => {
+  const f = camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize();
+  return camera.position.clone().addScaledVector(f, d);
+};
+const floatUi = {
+  spawn: () => floaters.spawn(camera.position, camera.getWorldDirection(new THREE.Vector3())),
+  drop: () => floaters.add(FLOATER_KINDS[Math.floor(Math.random() * FLOATER_KINDS.length)], ahead(14).setY(Math.max(camWater, 0) + 4)),
+  clear: () => floaters.clear(),
+};
+fFloat.add(floatUi, 'spawn').name('spawn flotsam ahead');
+fFloat.add(floatUi, 'drop').name('drop random prop');
+fFloat.add(floatUi, 'clear');
+fFloat.add(floaters.params, 'drag', 0, 6, 0.01);
+fFloat.add(floaters.params, 'angularDrag', 0, 4, 0.01);
+fFloat.add(floaters.params, 'buoyancy', 0, 2, 0.01);
+fFloat.add(underwater.params, 'scattering', 0, 0.2, 0.001);
+fFloat.add(underwater.params, 'shafts', 0, 4, 0.01);
+fFloat.add(underwater.params, 'shaftRange', 5, 120, 1);
+fFloat.add(underwater.params, 'meniscus', 0, 1, 0.01);
+fFloat.add(look, 'underwater', 0.5, 4, 0.01).name('underwater exposure');
+
 const fPost = gui.addFolder('Post');
 fPost.add(look, 'exposure', 0.1, 4, 0.01).name('exposure comp').onChange(updateExposure);
 fPost.add(post.params, 'bloomStrength', 0, 0.5, 0.001);
@@ -247,7 +300,7 @@ fQ.add(quality, 'resolution', 0.25, 1, 0.05).onFinishChange(resize);
 fQ.add(quality, 'msaa', [0, 2, 4, 8]).onChange(makeTargets);
 fQ.add(quality, 'reflections');
 fQ.add(quality, 'reflectionScale', 0.25, 1, 0.05).onFinishChange(makeTargets);
-[fWave, fShore, fWater, fPost].forEach((f) => f.close());
+[fWave, fShore, fWater, fFloat, fPost].forEach((f) => f.close());
 
 // --- frame ---------------------------------------------------------------------
 const gl = renderer.getContext();
@@ -259,12 +312,25 @@ function renderFrame(dt) {
   if (sunDirty) applySun();
   if (timing) timer.beginFrame();
 
+  // latest water heights (1-3 frames old) drive the camera test and the floaters
+  if (query.resultCount > 0) camWater = query.result[0];
+  floaters.ingest(query, 1);
+  floaters.step(dt);
+
   ocean.update(dt, timer);
   surface.update(camera, elapsed % 3600);
   terrain.uniforms.uTimeT.value = elapsed % 3600;
+  const pts = floaters.collectPoints([camera.position]);
+  query.submit(pts, floaters.count, floaters.layout, elapsed);
+
+  const camY = camera.position.y;
+  const submerged = camY < camWater - 0.3, nearSurface = camY < camWater + 1.2;
+  su.uCamSide.value = camY > camWater + 0.5 ? -1 : camY < camWater - 0.5 ? 1 : 0;
+  uwGain += ((submerged ? look.underwater : 1) - uwGain) * Math.min(1, dt * 4);
+  post.params.exposure = exposureBase * uwGain;
 
   timer.begin('reflection');
-  if (quality.reflections) {
+  if (quality.reflections && !submerged) {
     reflection.render(renderer, scene, camera);
     su.uReflection.value = reflection.target.texture;
   } else su.uReflection.value = emptyReflection;
@@ -279,16 +345,20 @@ function renderFrame(dt) {
   su.uShadowMap.value = sunLight.shadow.map.depthTexture;
   renderer.render(waterScene, camera);
 
+  let frame = hdrRT.texture;
+  if (nearSurface) {
+    timer.begin('underwater');
+    frame = underwater.render(renderer, hdrRT, camY < camWater - 0.8);
+  }
+
   timer.begin('post');
-  post.render(hdrRT.texture);
+  post.render(frame);
   if (timing) timer.endFrame();
 }
 
 function clampCamera() {
-  // stay above the tallest waves; no underwater rendering in v1
-  const minY = 1.2 + 0.03 * op.windSpeed * op.windSpeed * op.waveScale;
-  const ground = islandHeight(camera.position.x, camera.position.z) + 1.5;
-  const floor = Math.max(minY, ground);
+  // free to dive; just stay out of the ground
+  const floor = islandHeight(camera.position.x, camera.position.z) + 0.8;
   if (camera.position.y < floor) camera.position.y = floor;
 }
 
@@ -309,7 +379,10 @@ function runBenchmark(frames = 400) {
   return ms;
 }
 window.runBenchmark = runBenchmark;
-window.app = { camera, controls, sky, post, surface, ocean, terrain, timer, views, quality, renderer, markSun: () => (sunDirty = true) };
+window.app = {
+  camera, controls, sky, post, surface, ocean, terrain, timer, views, quality, renderer, floaters, query, underwater, look,
+  camWater: () => camWater, markSun: () => (sunDirty = true),
+};
 
 // --- HUD + loop ------------------------------------------------------------------
 const hud = document.getElementById('hud');
