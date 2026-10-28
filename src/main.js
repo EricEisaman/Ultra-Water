@@ -448,10 +448,10 @@ async function runBenchmark(frames = 300) {
   benchmarking = false;
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
   const gpu = Object.values(passes).reduce((a, b) => a + b, 0);
-  bench = `benchmark ${size.x}×${size.y}: ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps uncapped${timer.available ? ` (GPU ${gpu.toFixed(2)} ms)` : ''}`
+  bench = `benchmark ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps${timer.available ? ` (GPU ${gpu.toFixed(2)} ms)` : ''}`
     + Object.entries(passes).map(([k, v]) => `
   ${k.padEnd(12)} ${v.toFixed(3)} ms`).join('');
-  console.log(bench);
+  console.log(`${size.x}×${size.y} ${bench}`);
   return { ms, gpu, passes };
 }
 window.runBenchmark = runBenchmark;
@@ -461,23 +461,44 @@ window.app = {
 };
 
 // --- HUD + loop ------------------------------------------------------------------
-const hud = document.getElementById('hud');
-let bench = '', frames = 0, lastHud = performance.now(), last = performance.now();
-const gpuInfo = (() => {
+const $ = (id) => document.getElementById(id);
+const hud = $('hud'), graph = $('pGraph').getContext('2d'), uncapButton = $('pUncap'), fpsHistory = [];
+let bench = '', frames = 0, lastHud = performance.now(), last = performance.now(), uncapped = false;
+$('pGpu').textContent = (() => {
   const ext = gl.getExtension('WEBGL_debug_renderer_info');
-  return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL).replace(/ANGLE \(|\)$/g, '') : 'unknown GPU';
+  const raw = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'unknown GPU';
+  return raw.split(', ')[1]?.replace(/ \(0x.*$/, '') || raw;   // "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x2504) ...)"
 })();
+uncapButton.onclick = () => {
+  uncapped = !uncapped;
+  uncapButton.textContent = uncapped ? 'Cap to display' : 'Uncap FPS';
+  uncapButton.classList.toggle('on', uncapped);
+  fpsHistory.length = 0;
+};
 
 function updateHud(now) {
   const fps = (frames * 1000) / (now - lastHud);
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
-  let text = `${gpuInfo}\n${size.x}×${size.y}  MSAA ${quality.msaa}x${mobile ? ' (mobile)' : ''}  display fps ${fps.toFixed(0)}`;
+  $('pSpec').textContent = `${size.x}×${size.y} · ${quality.msaa}× MSAA · ${mobile ? 'mobile' : 'desktop'} profile`;
+  $('pFps').textContent = fps.toFixed(0);
+  $('pMode').textContent = uncapped ? 'UNCAPPED' : 'VSYNC';
+  $('pMs').textContent = `${(1000 / fps).toFixed(2)} ms/frame`;
+  fpsHistory.push(fps);
+  if (fpsHistory.length > 40) fpsHistory.shift();
+  const { width: w, height: h } = graph.canvas, lo = Math.min(...fpsHistory) * 0.9, hi = Math.max(...fpsHistory) * 1.05;
+  graph.clearRect(0, 0, w, h);
+  graph.beginPath();
+  fpsHistory.forEach((v, i) => graph.lineTo((w * i) / Math.max(1, fpsHistory.length - 1), h - (h * (v - lo)) / (hi - lo || 1)));
+  graph.strokeStyle = '#2cc9ff';
+  graph.lineWidth = 3;
+  graph.stroke();
+  let text = '';
   if (timer.available && timer.total > 0) {
-    // at vsync the GPU downclocks, so these read high; the benchmark measures at full clocks
-    text += `\nGPU timers ${timer.total.toFixed(2)} ms (vsync-idle clocks)`;
+    // at vsync the GPU downclocks, so these read high; uncapped or the benchmark measure at full clocks
+    text += `GPU timers ${timer.total.toFixed(2)} ms${uncapped ? '' : ' (vsync-idle clocks)'}`;
     for (const [k, v] of Object.entries(timer.ms)) text += `\n  ${k.padEnd(10)} ${v.toFixed(3)} ms`;
-  } else text += '\n(GPU timer queries unavailable; use benchmark)';
-  if (bench) text += `\n${bench}`;
+  }
+  if (bench) text += `${text ? '\n' : ''}${bench}`;
   hud.textContent = text;
   frames = 0;
   lastHud = now;
@@ -510,18 +531,44 @@ function setResolution(r) {
   auto.n = -60;   // the resize hitches; let it settle
 }
 
-function loop(now) {
-  if (auto.cap30 && (auto.odd = !auto.odd)) { requestAnimationFrame(loop); return; }
-  const ms = now - last, dt = Math.min(ms / 1000, 0.1);
+function tick(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
-  if (benchmarking) { requestAnimationFrame(loop); return; }
-  if (quality.autoResolution) autoResolution(ms);
   controls.update();
   clampCamera();
   renderFrame(dt);
   frames++;
   if (now - lastHud > 500) updateHud(now);
+}
+
+function loop(now) {
+  if (uncapped) { spin(); return; }
+  if (auto.cap30 && (auto.odd = !auto.odd)) { requestAnimationFrame(loop); return; }
+  if (benchmarking) last = now;
+  else {
+    if (quality.autoResolution) autoResolution(now - last);
+    tick(now);
+  }
   requestAnimationFrame(loop);
+}
+
+// uncapped: frames back-to-back off the display's clock (it still shows the latest one at
+// each refresh), at most three in flight so the counter reads frames the GPU finished
+const fences = [], chan = new MessageChannel();
+chan.port1.onmessage = spin;
+function spin() {
+  if (!uncapped || document.hidden) {   // hidden: back to rAF, which pauses until visible
+    fences.splice(0).forEach((s) => gl.deleteSync(s));
+    requestAnimationFrame(loop);
+    return;
+  }
+  while (fences.length && gl.clientWaitSync(fences[0], 0, 0) !== gl.TIMEOUT_EXPIRED) gl.deleteSync(fences.shift());
+  if (fences.length < 3 && !benchmarking) {
+    tick(performance.now());
+    fences.push(gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0));
+    gl.flush();
+  }
+  chan.port2.postMessage(0);
 }
 
 resize();
