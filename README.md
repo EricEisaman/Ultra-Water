@@ -116,6 +116,8 @@ Earlier versions of this README quoted numbers 2–4× lower. Those came from a 
   - Wave caustics.
 - Instanced rocks. The static shadow map re-renders only when the sun moves.
 
+The `Water` folder has a `colour preset` dropdown (clear, tropical, toxic green, purple, rust orange, murky brown). Each sets the absorption, in-scatter colour, thin-foam tint and underwater scattering together; `clarity` and `scatter` still adjust on top.
+
 Camera presets `Flotsam` and `Underwater` spawn a field of floating props. The `Floaters & underwater` folder has spawn, drop and clear buttons, plus drag, buoyancy, scattering, shaft and meniscus controls.
 
 ## Not in yet

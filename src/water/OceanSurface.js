@@ -285,6 +285,7 @@ uniform vec3 uSunDir;
 uniform vec3 uSunColor;
 uniform vec3 uAbsorption;
 uniform vec3 uScatterColor;
+uniform vec3 uFoamTint;     // thin foam: the water colour showing through the bubbles
 uniform vec4 uSSS;          // peak strength, view strength, shadow strength, -
 uniform vec4 uFoam;         // bias, scale, shore band (m), brightness
 uniform vec4 uOptics;       // base roughness, refraction strength, reflection distortion, fog density
@@ -546,7 +547,7 @@ void main() {
     float fl = dot(fN, uSunDir);
     float ao = mix(0.45, 1.0, smoothstep(0.15, 0.75, fh));
     float solid = smoothstep(0.2, 0.9, dens * (0.55 + 0.7 * fh));
-    vec3 foamAlbedo = mix(vec3(0.62, 0.78, 0.82), vec3(0.95), max(solid, smoothstep(0.3, 0.9, pat) * 0.6));
+    vec3 foamAlbedo = mix(uFoamTint, vec3(0.95), max(solid, smoothstep(0.3, 0.9, pat) * 0.6));
     vec3 lit = sun * (0.15 + 0.85 * clamp(fl * 0.8 + 0.2, 0.0, 1.0)) * mix(ao, 1.0, 0.4) + ambient * 1.1 * ao;
     // sun behind the crest shines through the thin foam on top
     lit += sun * pow(clamp(dot(uSunDir, -V), 0.0, 1.0), 4.0) * 0.4 * (1.0 - solid);
@@ -603,6 +604,7 @@ export class OceanSurface {
       uSunColor: { value: sky.sunColor },
       uAbsorption: { value: new THREE.Vector3(0.42, 0.075, 0.048) },
       uScatterColor: { value: new THREE.Color(0.0, 0.05, 0.08) },
+      uFoamTint: { value: new THREE.Color(0.62, 0.78, 0.82) },
       uSSS: { value: new THREE.Vector4(1.6, 0.06, 0.05, 0) },
       uFoam: { value: new THREE.Vector4(0.05, 1.3, 0.35, 0.85) },
       uOptics: { value: new THREE.Vector4(0.02, 0.06, 0.04, 1 / 18000) },
