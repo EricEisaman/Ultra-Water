@@ -204,7 +204,7 @@ export function makeFloater(kind, patchMaterial) {
   patchMaterial(material);
   const mesh = new THREE.Mesh(geo, material);
   mesh.name = `floater-${kind}`;
-  mesh.castShadow = false;
+  mesh.castShadow = false;  // floaters have their own shadow map (floaterShadow.js)
   mesh.receiveShadow = true;
   mesh.layers.enable(1); // planar reflection layer
   geo.computeBoundingBox();

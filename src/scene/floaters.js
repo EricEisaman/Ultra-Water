@@ -27,6 +27,8 @@ class Body {
     this.vel = new THREE.Vector3();
     this.quat = new THREE.Quaternion();
     this.angVel = new THREE.Vector3();
+    this.radius = desc.size.length() / 2;
+    this.wet = false;
     const n = desc.samples.length;
     this.cellVolume = desc.volume / n;
     this.cellMass = m / n;
@@ -53,7 +55,9 @@ class Body {
 
 export class Floaters {
   constructor({ scene, heightAt, patchMaterial }) {
-    this.scene = scene;
+    // own (nested) scene so the floater shadow map can render just these
+    this.scene = new THREE.Scene();
+    scene.add(this.scene);
     this.heightAt = heightAt;
     this.patchMaterial = patchMaterial;
     this.bodies = [];
@@ -61,6 +65,8 @@ export class Floaters {
     this.points = new Float32Array(1024);  // xz pairs submitted to WaterQuery
     this.count = 0;
     this.params = { drag: 1.6, angularDrag: 0.8, buoyancy: 1 };
+    this.time = 0;
+    this.impacts = [];   // last few water entries: { x, z, t, amp, size } for ripple rings
   }
 
   add(kind, pos, yaw = Math.random() * Math.PI * 2) {
@@ -131,6 +137,7 @@ export class Floaters {
 
   step(dt) {
     dt = Math.min(dt, 1 / 20);
+    this.time += dt;
     const steps = Math.max(1, Math.ceil(dt / SUBSTEP)), h = dt / steps;
     for (let s = 0; s < steps; s++) for (const b of this.bodies) this.integrate(b, h);
     for (const b of this.bodies) {
@@ -143,6 +150,7 @@ export class Floaters {
     const P = this.params;
     const force = _f.set(0, -b.mass * G, 0), torque = _t.set(0, 0, 0);
     const cell = b.desc.cellHeight;
+    let wet = false;
     b.updateWorld();
     for (let i = 0; i < b.world.length; i++) {
       const p = b.world[i], w = b.water;
@@ -150,6 +158,7 @@ export class Floaters {
       _vp.copy(b.angVel).cross(_r).add(b.vel);                 // velocity of this cell
       const sub = THREE.MathUtils.clamp((w[i * 4] - p.y) / cell + 0.5, 0, 1);
       if (sub > 0) {
+        wet = true;
         _v.set(0, RHO * G * b.cellVolume * sub * P.buoyancy, 0);
         // drag against the moving water (gives orbital bobbing and surf push)
         const k = P.drag * b.cellMass * sub;
@@ -169,6 +178,13 @@ export class Floaters {
         torque.add(_c.copy(_r).cross(_v));
       }
     }
+    // hitting the water fast: ripple rings (and a splash) sized by the body and speed
+    if (wet && !b.wet && b.vel.y < -1.5) {
+      const s = b.desc.size;
+      this.impacts.push({ x: b.pos.x, z: b.pos.z, t: this.time, amp: Math.min(0.35, 0.03 * -b.vel.y * Math.min(s.x, s.z)), size: Math.max(s.x, s.z) * 0.5 });
+      if (this.impacts.length > 8) this.impacts.shift();
+    }
+    b.wet = wet;
     b.vel.addScaledVector(force, h / b.mass);
     b.pos.addScaledVector(b.vel, h);
 

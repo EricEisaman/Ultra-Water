@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { FullscreenQuad, rawPass } from '../engine/fullscreen.js';
 
-// Tessendorf FFT ocean: 3 cascades of 256² stacked in one 256×768 atlas so every
+// Tessendorf FFT ocean: 4 cascades of 256² stacked in one 256×1024 atlas so every
 // IFFT stage is a single draw. Output per cascade (RGBA16F, mipmapped, repeat):
 //   displacement = (λDx, Dy, λDz, turbulence)   slope = (sx, sz, sx², sz²)
 // Slopes are divided out at full resolution so their mips give mean + second moment
@@ -9,8 +9,11 @@ import { FullscreenQuad, rawPass } from '../engine/fullscreen.js';
 
 export const N = 256;
 const LOG_N = 8;
-export const CASCADE_LENGTHS = [600, 85, 12];
+// last cascade is the gravity-capillary detail layer; 12/2.1 is non-integer so tiles don't align
+export const CASCADE_LENGTHS = [600, 85, 12, 2.1];
 const G = 9.81;
+// surface tension / density (m³/s²): ω² = g·k + (σ/ρ)·k³
+const SIGMA_RHO = 7.4e-5;
 // ω is quantised to multiples of 2π/LOOP and time wraps at LOOP, so the sim loops
 // seamlessly and fp32 phase never degrades.
 const LOOP = 300;
@@ -21,14 +24,17 @@ precision highp int;
 #define N ${N}
 #define PI 3.14159265359
 #define G ${G.toFixed(2)}
+#define ST ${SIGMA_RHO.toExponential()}
 vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+float omega(float k) { return sqrt(G * k + ST * k * k * k); }
 `;
 
 const INIT_FRAG = COMMON + /* glsl */`
 uniform vec4 uSpecA[2]; // scale, angle, spreadBlend, swell
 uniform vec4 uSpecB[2]; // alpha, peakOmega, gamma, shortWavesFade
-uniform vec3 uLength;
-uniform vec4 uCut;      // c0 hi, c1 hi, -, -
+uniform vec4 uLength;
+uniform vec4 uCut;      // c0 hi, c1 hi, c2 hi, -
+uniform float uCapFade; // short-wave fade for cascade 3 (cascades 0-2 use uSpecB.w)
 uniform uint uSeed;
 out vec4 outColor;
 
@@ -79,16 +85,17 @@ vec2 h0(ivec2 id, int c) {
   vec2 k = vec2(id - N / 2) * dk;
   float kl = length(k);
   float lo = c == 0 ? 1e-4 : uCut[c - 1];
-  float hi = c == 2 ? 1e4 : uCut[c];
+  float hi = c == 3 ? 1e4 : uCut[c];
   if (kl < lo || kl > hi) return vec2(0.0);
-  float w = sqrt(G * kl);
-  float dwdk = G / (2.0 * w);
+  float w = omega(kl);
+  float dwdk = (G + 3.0 * ST * kl * kl) / (2.0 * w);
   float theta = atan(k.y, k.x);
   float S = 0.0;
   for (int i = 0; i < 2; i++) {
     if (uSpecA[i].x <= 0.0) continue;
+    float fade = c == 3 ? uCapFade : uSpecB[i].w;
     S += jonswap(w, uSpecA[i], uSpecB[i]) * directional(theta, w, uSpecA[i], uSpecB[i])
-       * exp(-uSpecB[i].w * uSpecB[i].w * kl * kl);
+       * exp(-fade * fade * kl * kl);
   }
   return gauss(id, c) * sqrt(2.0 * S * dwdk / kl * dk * dk);
 }
@@ -104,7 +111,7 @@ void main() {
 
 const EVOLVE_FRAG = COMMON + /* glsl */`
 uniform highp sampler2D uH0;
-uniform vec3 uLength;
+uniform vec4 uLength;
 uniform float uTime;
 layout(location = 0) out vec4 out0;
 layout(location = 1) out vec4 out1;
@@ -119,8 +126,8 @@ void main() {
   float kl = length(k);
   float ik = kl > 1e-6 ? 1.0 / kl : 0.0;
   const float W0 = 2.0 * PI / ${LOOP.toFixed(1)};
-  float w = floor(sqrt(G * kl) / W0) * W0;
-  float ph = w * uTime;
+  // ω = n·W0; phase reduced to [0, 2π) before sin/cos (the capillary cascade reaches ω ≈ 130)
+  float ph = 2.0 * PI * fract(floor(omega(kl) / W0) * (uTime / ${LOOP.toFixed(1)}));
   vec2 e = vec2(cos(ph), sin(ph));
   vec4 h0 = texelFetch(uH0, p, 0);
   vec2 h = cmul(h0.xy, e) + cmul(h0.zw, vec2(e.x, -e.y));
@@ -203,6 +210,10 @@ export const defaultOceanParams = () => ({
   windSwell: 0.25,
   gamma: 3.3,
   shortWavesFade: 0.04,
+  // cascade 3 only (calibration knob): 0.004 is the bare capillary spectrum, but its
+  // mean square slope (0.145) is 3x Cox-Munk for the whole sea and turns the water to
+  // brushed metal; 0.08 keeps fine ripples up close and the water glossy
+  capillaryFade: 0.08,
   waveScale: 1,
   swellScale: 0.7,
   swellWindSpeed: 7,
@@ -226,12 +237,13 @@ export class OceanSim {
       type: THREE.FloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
       depthBuffer: false, generateMipmaps: false,
     };
-    this.h0RT = new THREE.WebGLRenderTarget(N, N * 3, fft);
+    const H = N * CASCADE_LENGTHS.length;
+    this.h0RT = new THREE.WebGLRenderTarget(N, H, fft);
     // the 16 IFFT stages are bandwidth-bound; fp16 halves that, and its ~1e-3 relative
     // error is about a millimetre of displacement on the largest cascade
     const half = { ...fft, type: THREE.HalfFloatType, count: 2 };
-    this.ping = new THREE.WebGLRenderTarget(N, N * 3, half);
-    this.pong = new THREE.WebGLRenderTarget(N, N * 3, half);
+    this.ping = new THREE.WebGLRenderTarget(N, H, half);
+    this.pong = new THREE.WebGLRenderTarget(N, H, half);
 
     const out = {
       type: THREE.HalfFloatType, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter,
@@ -247,13 +259,14 @@ export class OceanSim {
     renderer.setClearColor(prevClear, prevAlpha);
     renderer.setRenderTarget(null);
 
-    const lengths = new THREE.Vector3(...CASCADE_LENGTHS);
+    const lengths = new THREE.Vector4(...CASCADE_LENGTHS);
     this.initMat = rawPass(INIT_FRAG, {
       uSpecA: { value: [new THREE.Vector4(), new THREE.Vector4()] },
       uSpecB: { value: [new THREE.Vector4(), new THREE.Vector4()] },
       uLength: { value: lengths },
-      uCut: { value: new THREE.Vector4(
-        (2 * Math.PI / CASCADE_LENGTHS[1]) * 6, (2 * Math.PI / CASCADE_LENGTHS[2]) * 6, 0, 0) },
+      // cascade c owns [cut[c-1], cut[c]); each cut sits at 6 fundamentals of the next cascade
+      uCut: { value: new THREE.Vector4(...CASCADE_LENGTHS.slice(1).map((L) => (2 * Math.PI / L) * 6), 0) },
+      uCapFade: { value: 0 },
       uSeed: { value: 1337 },
     });
     this.evolveMat = rawPass(EVOLVE_FRAG, {
@@ -282,6 +295,7 @@ export class OceanSim {
     u.uSpecB.value[0].set(wind.alpha, wind.peakOmega, p.gamma, p.shortWavesFade);
     u.uSpecA.value[1].set(p.swellScale * p.waveScale, rad(p.swellDirection), 1, p.swellSwell);
     u.uSpecB.value[1].set(swell.alpha, swell.peakOmega, p.gamma, p.shortWavesFade);
+    u.uCapFade.value = p.capillaryFade;
     this.quad.material = this.initMat;
     this.quad.render(this.renderer, this.h0RT);
     this.dirty = false;
@@ -323,7 +337,7 @@ export class OceanSim {
     au.uFoamRecovery.value = p.foamRecovery;
     q.material = this.assembleMat;
     const next = this.parity ^ 1;
-    for (let c = 0; c < 3; c++) {
+    for (let c = 0; c < this.out.length; c++) {
       au.uCascade.value = c;
       au.uPrev.value = this.out[c][this.parity].textures[0];
       q.render(r, this.out[c][next]);

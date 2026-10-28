@@ -7,109 +7,122 @@ npm install
 npm run dev
 ```
 
-Open the printed localhost URL. Orbit with the mouse. Pick shots from the `camera` dropdown (they also set the sun). The `benchmark (uncapped)` button renders 400 frames back-to-back to measure true throughput. It also runs once, 3 s after load.
+Open the printed localhost URL. Orbit with the mouse. Pick shots from the `camera` dropdown (they also set the sun). The `benchmark (uncapped)` button renders 300 frames back-to-back with the render loop paused and times them to GPU completion with a fence. It also runs once, 3 s after load.
 
 ## Performance
 
-Measured with the in-page benchmark on an RTX 3060 (Chrome, ANGLE/D3D11), 4× MSAA, all features on. The pixel counts match each resolution; the aspect ratio was the browser window's.
-
-| Pixels | ms / frame | fps (uncapped) |
-|---|---|---|
-| 977×846 | 1.2 | ~840 (CPU-bound) |
-| 1080p-equivalent | 1.87 | ~535 |
-| 1440p-equivalent | 2.70 | ~370 |
-| 4K-equivalent | 3.35 | ~300 |
-
-With floaters and underwater rendering, at 1954×1692 (3.3 MP, `devicePixelRatio` 2). Each number is the best of 5 × 200 frames:
+Measured with the in-page benchmark on an RTX 3060 (Chrome, ANGLE/D3D11), 4× MSAA, all features on, at 1954×1692 (3.3 MP, the pixel count of 1440p; `devicePixelRatio` 2 on the browser window):
 
 | Shot | ms / frame | fps (uncapped) |
 |---|---|---|
-| Golden hour | 1.02 | ~980 |
-| Flotsam (10 floating props) | 1.48 | ~675 |
-| Breakers | 1.68 | ~595 |
-| Underwater | 0.96 | ~1040 |
+| Open ocean | 3.30 | ~303 |
+| Breakers | 4.17 | ~240 |
+| Golden hour | 4.20 | ~238 |
+| Lagoon | 4.48 | ~223 |
+| Flotsam (10 floating props) | 4.62 | ~217 |
+| Underwater | 4.71 | ~212 |
+| Aerial | 4.80 | ~208 |
 
-The underwater pass on its own measures 0.59 ms at that size with GPU timer queries. The reflection pass is skipped underwater.
+Per pass in Breakers: water 1.66 ms, opaque (island, rocks, props) 1.21, post 0.37, caustics 0.24, FFT sim ~0.45 (independent of resolution). Caustics cost more under a low sun (about 0.36 ms at 3.5° elevation), because the refracted rays fold more.
 
-The HUD's GPU timer-query numbers read high while vsync-capped, because the GPU downclocks when idle. Use the benchmark number.
+The crest-foam upgrade landed after this run. It adds three texture taps and some ALU per foam pixel only. It hasn't been re-measured cleanly yet, because another application was loading the GPU at the time.
+
+Earlier versions of this README quoted numbers 2–4× lower. Those came from a benchmark that synced with `readPixels`/`finish`, which ANGLE doesn't wait on. The fence-based benchmark is the one to trust. The HUD's GPU timer-query numbers read high while vsync-capped, because the GPU downclocks between frames.
 
 ## What's in it
 
 **Waves** (`src/water/OceanSim.js`)
-- Tessendorf FFT with 3 cascades of 600 / 85 / 12 m at 256². The ratio is non-integer, so tiling doesn't show.
-- JONSWAP wind sea plus swell, with cos-2s directional spreading (Hasselmann spread power).
-- The cascades are stacked in one 256×768 atlas, so each Stockham IFFT stage is one MRT draw: 16 in total.
+- Tessendorf FFT with 4 cascades of 600 / 85 / 12 / 2.1 m at 256², stacked in one 256×1024 atlas, so each Stockham IFFT stage is one MRT draw.
+- The 2.1 m cascade is the capillary band. It uses capillary-gravity dispersion (ω² = gk + σk³/ρ), and only its slopes are used, not its displacement. The 12 m cascade hands its sub-35 cm band to it (`capillaryFade`, calibrated so the summed mean-square slope stays near Cox–Munk).
+- JONSWAP wind sea plus swell, with cos-2s directional spreading.
 - ω is quantised to a 300 s loop, so fp32 phase never drifts.
 - Foam comes from the Jacobian, with dt-based recovery.
-- Slopes are divided out at full resolution and stored as (sx, sz, sx², sz²). Their mips give the slope variance used for roughness (LEAN-style), which is what makes the far field and the glitter path correct instead of shimmering.
+- Slopes are stored as (sx, sz, sx², sz²). Their mips give the slope variance used for roughness (LEAN-style). Each cascade's 1×1 mip is its mean-square slope, and the Cox–Munk remainder for the wind speed is added as unresolved roughness.
 
 **Surface** (`src/water/OceanSurface.js`)
-- A camera-centred polar grid (~190k verts) whose rings grow geometrically, scaled with camera height.
-- Displacement is band-limited to the local vertex spacing with `textureLod`, so it doesn't swim and needs no clipmap snapping.
+- A camera-centred polar grid (~190k verts) whose rings grow geometrically, scaled with camera height. Displacement is band-limited to the local vertex spacing with `textureLod`, so it doesn't swim.
 - Per-pixel shading:
-  - Normals and variance roughness from 3 cascades.
-  - Geometric specular AA.
-  - Lagarde roughness-aware Fresnel.
-  - GGX sun with the island's shadow.
-  - Stochastic glitter on the bright sun path.
-  - Half-res planar reflection of the island, falling back to the sky cube.
-  - Depth-validated refraction.
-  - Beer-Lambert absorption.
-  - Atlas-style subsurface scatter on crests.
-  - Foam that erodes as it ages.
-  - Aerial perspective.
-- Shoreline breakers come from a coast SDF baked at startup (`shoreMap.js`, exact EDT). Gerstner fronts travel up the distance gradient with these properties:
-  - Green's-law shoaling.
-  - A breaking limit.
-  - Bigger sets on coasts facing the swell.
-  - Whitewater whose foam texture rides along with the bore.
+  - Normals and variance roughness from 4 cascades, geometric specular AA, Lagarde roughness-aware Fresnel.
+  - GGX sun with the island's and the floaters' shadows.
+  - Glints: the GGX lobe as a finite number of facets. Each pixel-sized cell draws a Poisson count of sun-mirroring facets, which crossfade between draws so they twinkle.
+  - Half-res mipmapped planar reflection of the island over the sky cube, blurred by roughness.
+  - Depth-validated refraction with a smooth fallback at object edges, Beer-Lambert absorption, Atlas-style subsurface scatter on crests, and aerial perspective.
+- Shore breakers run on an eikonal travel-time field (`shoreMap.js`: fast sweeping from the coast with c = √(g·depth), then direction, front curvature and a ray-tube shoaling factor):
+  - The phase is ω(τ + t), so fronts slow down, bunch up and refract around the bathymetry.
+  - Green's law plus ray-tube shoaling, a breaking limit of 0.42 × depth, and bigger sets on coasts facing the swell.
+  - Plunging lean near the break point, with translucent lips. The lean and both wave trains' Gerstner pinch share one budget, so the heightfield never folds over.
+  - Peeling: each crest breaks early in some sections and late in others, with a new layout every wave.
+  - Where fronts from two coast stretches meet (shocks), the waves fade out instead of folding into sheets.
+- Foam:
+  - The baked foam texture holds a lace pattern plus a "cauliflower" billow height and its gradient.
+  - Crest whitewater is textured on the displaced surface with a world-space flow map that rides shoreward at the phase speed. Its two phases are crossfaded, which also makes it churn.
+  - Coverage erodes with age, from solid whitewater to holes to lace. The billows bump the normal and shade their creases. Thin foam is tinted by the water under it and glows when backlit. Bubble tops get a little sheen.
+  - Lace stays behind in the surf zone and drifts shoreward.
+- Beach swash (shared GLSL with the terrain): each bore runs up the sand and drains back as a thin film with a foam edge, leaving a wet line that dries over a few seconds.
+- Impact rings: a floater hitting the water starts Cauchy–Poisson ripple rings, plus a splash crown (`Spray.js`).
 - FFT swell fades out in the shallows and the shore waves take over.
 
-**Underwater** (`src/water/UnderwaterPass.js`, underside branch in `OceanSurface.js`)
-- The water mesh is double-sided. Seen from below it shades Snell's window: the sky in the refracted direction, the sun lobe, and anything above the water from the frame, with total internal reflection outside the window.
-- Folded crests flip triangles. Faces that can't face the camera's side are discarded.
-- A fullscreen pass runs when the camera is within 1.2 m of the surface or below it:
-  - Per-pixel waterline. The water pass tags what each pixel sees in alpha (top or underside), so the split follows the mesh. Where no water is visible, the near-plane point is tested against the exact surface (`waterAt`).
-  - A meniscus line where the top meets the underside near the lens.
-  - Beer-Lambert extinction over the camera-to-hit distance, towards an in-scatter colour that matches the underside, brighter looking up.
-  - Sun shafts: 8 jittered steps of single scattering (Henyey-Greenstein) through the seabed caustic pattern, projected along the refracted sun. The caustic mip is chosen from how far each step moves through the pattern, so rays crossing it average to haze instead of banding.
-- Underwater, exposure is boosted (`underwater exposure`) and the planar reflection is skipped. The camera is only kept out of the ground.
+**Caustics** (`src/water/Caustics.js`)
+- Area-ratio splatting (after Evan Wallace): a grid over the 12 m cascade is refracted through its slopes onto planes at 1.5, 4 and 10 m. Each landed triangle adds its area ratio, so the pattern has a mean of 1 and only redistributes the direct sun.
+- The slopes are sampled with a cubic B-spline. With bilinear sampling every slope texel would land as its own bead along the caustic lines.
+- Both splat targets are 4× MSAA, so fold slivers thinner than a texel add by coverage instead of breaking into dots. They are sized by the sun-disc blur at each depth: 512² (2.3 cm) for 1.5 m, 256² for 4 m and 10 m.
+- Lookups go through the refracted entry point, so the seabed, the props and the underwater shafts all see the same pattern.
 
-**Floating objects** (`src/water/WaterQuery.js`, `src/scene/floaters.js`, `src/scene/floaterMeshes.js`)
-- Water heights come from the GPU. A 512×1 pass evaluates exactly the rendered surface (FFT cascades plus shore waves, with the choppy displacement inverted by fixed-point iteration). It is read back with `readRenderTargetPixelsAsync` (PBO + fence), so it never stalls. Results are 1–2 frames old, with at most 2 reads in flight.
-- Slot 0 of each query is the camera, which drives the underwater test. The rest are each body's sample points.
+**Underwater** (`src/water/UnderwaterPass.js`, underside branch in `OceanSurface.js`)
+- The water mesh is double-sided. Seen from below it shades Snell's window:
+  - The sky in the refracted direction, the sun as a GGX transmission lobe, and anything above the water from the frame.
+  - Outside the window, total internal reflection mirrors the deep-water colour.
+  - The critical-angle edge is blurred by the roughness.
+- A fullscreen pass runs when the camera is near or below the surface:
+  - Waterline split per pixel. The water pass tags what each pixel sees in alpha; elsewhere a coarse 64×36 lens-depth target is used.
+  - A meniscus line where the top meets the underside near the lens.
+  - Beer-Lambert extinction towards an in-scatter colour that matches the underside.
+  - Half-res sun shafts: 24 jittered steps of Henyey-Greenstein single scattering, lit through the wave caustics and the terrain and floater shadows at each sample's surface entry point, with a depth-aware 4-tap upsample.
+- Marine snow (`MarineSnow.js`), exposure compensation under water (`underwater exposure`), and water droplets on the lens for a few seconds after surfacing.
+
+**Floating objects** (`src/water/WaterQuery.js`, `src/scene/floaters.js`, `src/scene/floaterMeshes.js`, `src/scene/floaterShadow.js`)
+- Water heights come from the GPU. A 512×1 pass evaluates exactly the rendered surface, and is read back asynchronously (PBO + fence), so it never stalls.
 - Rigid bodies (crate, barrel, buoy, boat):
-  - Each body is split into cells. Each cell gets Archimedes buoyancy for its submerged fraction, plus drag against the local water velocity, applied at the cell. Heave, roll and pitch all come from that.
-  - Water velocity is the change in queried displacement over time, clamped, because at steep fronts the fixed-point rate overstates particle speed.
-  - 240 Hz substeps, box inertia, and a spring-and-friction contact with the island heightfield for beaching.
-- The prop meshes are procedural, closed and vertex-coloured. They get the same underwater light absorption, caustics and fog patch as the terrain.
+  - Buoyancy per cell, with drag against the local water velocity.
+  - 240 Hz substeps.
+  - Contact with the island heightfield for beaching.
+- Floaters have their own sun shadow map: an ortho camera fitted to the bodies every frame, so the big static shadow map is never re-rendered. It is read by the water, the terrain (at the refracted entry point under water) and the shafts.
 
 **Pipeline** (`src/main.js`)
-1. Ingest the last water query, step the floaters, run the sim passes, submit the next query.
+1. Ingest the last water query, step the floaters, then:
+   - render the floater shadow map;
+   - update the impact rings;
+   - run the FFT;
+   - splat the caustics;
+   - submit the next query.
 2. Planar reflection (half res, skipped underwater).
 3. Opaque pass into a single 4× MSAA HDR target.
-4. Water pass. three resolves colour and depth, then the resolved colour is restored into the MSAA buffer (three invalidates it), and the water is drawn depth-tested against the kept MSAA depth. This gives correct per-sample edges.
+4. Water pass, depth-tested against the kept MSAA depth for correct per-sample edges.
 5. Underwater pass, when near or below the surface.
-6. Dual-filter bloom with Karis average (`PostFX.js`), then AgX with a punchy look.
+6. Post (`PostFX.js`):
+   - GPU auto exposure, metered in log space and adapted over time; the GUI value is compensation.
+   - Dual-filter bloom with Karis average.
+   - AgX.
+   - Lens droplets.
+   - TPDF dither.
 
 **Scene**
-- Preetham sky with clouds, baked to a mipmapped 1024 HDR cube when the sun moves. It serves as the background, reflection, fog colour and IBL. The sun disc is analytic.
-- Procedural island with biome shading, wet sand, sand ripples, sunlight absorbed through the water column, and min-blended procedural caustics.
-- Instanced rocks.
-- Shadow map that re-renders only when the sun moves.
+- Hillaire 2020 atmosphere (`atmosphere.js`): transmittance, multiple-scattering and sky-view LUTs with ozone. Clouds are on top. It is baked into a mipmapped 1024 HDR cube when the sun moves, and serves as the background, reflection, fog colour and IBL.
+- Procedural island with:
+  - Biome shading and wet sand.
+  - Swash film and wet line.
+  - Wave-formed sand ripples whose crests meander, fork and fade in patches.
+  - Sunlight that arrives refracted under water, dimmed by Fresnel transmission and absorbed along its path. Both shadow maps are read at the surface entry point, so up-sun sand bars don't shadow the whole bed.
+  - Wave caustics.
+- Instanced rocks. The static shadow map re-renders only when the sun moves.
 
 Camera presets `Flotsam` and `Underwater` spawn a field of floating props. The `Floaters & underwater` folder has spawn, drop and clear buttons, plus drag, buoyancy, scattering, shaft and meniscus controls.
 
 ## Not in yet
 
-- Wakes, splashes and object-to-water interaction. Floaters are moved by the water but don't disturb it.
-- Floaters don't collide with each other and don't cast shadows, because the shadow map is static.
-- Breakers are heightfield waves, so they never curl over.
+- Wakes behind moving objects. Floaters only disturb the water when they drop in (rings and splash).
+- Floaters don't collide with each other.
+- Breakers are heightfield waves, so they lean but never curl over into a tube.
 - The surface mesh is a fan inside 1 m of the camera, so detail right at the lens is coarse when sitting on the waterline.
 
-The design was argued out with a second agent before building. The main changes from the first plan were:
-- A single-MSAA water pass instead of a manual depth compare.
-- Planar reflection instead of SSR.
-- Slope-moment roughness instead of a distance heuristic.
-- Larger cascades.
-- Shore waves.
+The design was argued out with a second agent before building, and again for each round of upgrades.

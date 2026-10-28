@@ -3,9 +3,13 @@ import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { buildTerrain } from './terrainGeometry.js';
 import { islandHeight } from './islandHeight.js';
 import { fbm } from './noise.js';
+import { CAUSTICS_GLSL } from '../water/Caustics.js';
+import { FLOAT_SHADOW_GLSL } from './floaterShadow.js';
+import { SHORE_GLSL, SWASH_GLSL } from '../water/OceanSurface.js';
 
 // Island + shore rocks on MeshStandardMaterial, patched with: biome colouring,
-// wet sand sheen, sunlight absorption under water and procedural caustics.
+// wet sand sheen, refracted + absorbed sunlight under water, wave-driven caustics and
+// the floater shadow map.
 const VERT_PARS = /* glsl */`
 varying vec3 vWPos;
 varying vec3 vWNrm;
@@ -14,16 +18,30 @@ varying vec3 vWNrm;
 const FRAG_PARS = /* glsl */`
 varying vec3 vWPos;
 varying vec3 vWNrm;
-uniform sampler2D uCaustics;
 uniform samplerCube uSkyCube;
 uniform vec3 uAbsorption;
 uniform vec3 uSunDirT;
-uniform float uTimeT;
 uniform float uCausticStrength;
 uniform float uFogDensity;
+${CAUSTICS_GLSL}
+${FLOAT_SHADOW_GLSL}
+${SHORE_GLSL}
+${SWASH_GLSL}
 float th(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 float tn(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
   return mix(mix(th(i), th(i + vec2(1, 0)), u.x), mix(th(i + vec2(0, 1)), th(i + 1.0), u.x), u.y); }
+// ripple marks: the phase along d (wavenumber w) is warped by noise of scale s and
+// amplitude a (metres along d), so crests meander and fork where the warp gets steep
+float ripplePhase(vec2 p, vec2 d, float w, float s, float a) {
+  return w * (dot(p, d) + (tn(p * s) - 0.5) * a + (tn(p * s * 0.27 + 4.0) - 0.5) * a * 3.0);
+}
+// slope of h = amp (sin ph - 0.25 cos 2ph): sharp crests, broad troughs
+vec2 rippleSlope(vec2 p, vec2 d, float w, float s, float a, float amp) {
+  float ph = ripplePhase(p, d, w, s, a);
+  vec2 grad = (vec2(ripplePhase(p + vec2(0.01, 0.0), d, w, s, a), ripplePhase(p + vec2(0.0, 0.01), d, w, s, a)) - ph) / 0.01;
+  return grad * amp * (cos(ph) + 0.5 * sin(2.0 * ph));
+}
+uniform mat4 uSunShadowMatrix;
 `;
 
 const ALBEDO = /* glsl */`
@@ -43,9 +61,14 @@ const ALBEDO = /* glsl */`
   albedo = mix(albedo, rock, smoothstep(0.78, 0.62, flat_) * smoothstep(-6.0, 1.0, hgt));
   albedo = mix(albedo, rock * 1.1, smoothstep(38.0, 52.0, hgt + n1 * 8.0));
 #endif
-  // wet band above the waterline
-  float wet = 1.0 - smoothstep(0.35, 1.3 + 0.5 * n1, hgt);
+  // wet band above the waterline, plus where the swash has run (dries over seconds)
+  vec3 sw = swash(vWPos.xz, hgt);
+  float wet = max(1.0 - smoothstep(0.35, 1.3 + 0.5 * n1, hgt), sw.z);
   albedo *= mix(1.0, 0.58, wet);
+  // the swash film itself: a faint water tint and foam on its leading edge
+  float film = smoothstep(0.0, 0.015, sw.x) * step(0.0, hgt);
+  albedo *= mix(vec3(1.0), vec3(0.78, 0.88, 0.92), film);
+  albedo = mix(albedo, vec3(0.92), sw.y * (0.5 + 0.5 * n2));
   diffuseColor.rgb = albedo;
 `;
 
@@ -58,13 +81,16 @@ const RIPPLES = /* glsl */`
     if (px < 0.5) {   // both ripple bands are faded out beyond this
     float sandMask = (1.0 - smoothstep(sandLine - 0.5, sandLine + 0.5, hgt)) * smoothstep(0.85, 0.95, flat_);
     sandMask *= mix(1.0, 0.25, smoothstep(-0.3, 0.6, hgt)); // dry sand: faint wind ripples only
-    vec2 g = vec2(0.0);
-    // long wave-formed ripples (~1.6 m) and short ones (~0.3 m), bent by noise
-    vec2 d1 = normalize(vec2(0.8, 0.6) + (vec2(tn(vWPos.xz * 0.02), tn(vWPos.xz * 0.02 + 5.0)) - 0.5));
-    float w1 = 3.9, p1 = dot(vWPos.xz, d1) * w1 + tn(vWPos.xz * 0.11) * 5.0;
-    g += d1 * w1 * cos(p1) * 0.025 * (1.0 - smoothstep(0.15, 0.5, px));
-    float w2 = 21.0, p2 = dot(vWPos.xz, vec2(-d1.y, d1.x) * 0.3 + d1) * w2 + tn(vWPos.xz * 0.5) * 4.0;
-    g += d1 * w2 * cos(p2) * 0.0025 * (1.0 - smoothstep(0.03, 0.09, px));
+    // long wave-formed ripples (~1.6 m) and short ones (~0.3 m), each fading in and out
+    // in patches
+    vec2 p = vWPos.xz;
+    vec2 d1 = normalize(vec2(0.8, 0.6) + (vec2(tn(p * 0.02), tn(p * 0.02 + 5.0)) - 0.5));
+    float a1 = 0.02 * (0.3 + 0.7 * smoothstep(0.25, 0.75, tn(p * 0.06 + 11.0)));
+    vec2 g = rippleSlope(p, d1, 3.9, 0.35, 0.8, a1) * (1.0 - smoothstep(0.15, 0.5, px));
+    if (px < 0.09) {
+      float a2 = 0.002 * (0.3 + 0.7 * smoothstep(0.25, 0.75, tn(p * 0.15 + 3.0)));
+      g += rippleSlope(p, normalize(d1 + vec2(-d1.y, d1.x) * 0.3), 21.0, 2.2, 0.1, a2) * (1.0 - smoothstep(0.03, 0.09, px));
+    }
     vec3 nW = normalize(vWNrm - vec3(g.x, 0.0, g.y) * sandMask);
     normal = normalize((viewMatrix * vec4(nW, 0.0)).xyz);
     }
@@ -74,24 +100,52 @@ const RIPPLES = /* glsl */`
 
 const UNDERWATER = /* glsl */`
   float wdepth = max(-vWPos.y, 0.0);
-  // sun and sky light reaching the bed through the water column
-  float sunPath = wdepth / max(uSunDirT.y, 0.15);
+  // sun and sky light reaching the bed through the water column (the sun along its
+  // refracted path)
+  vec3 rsun = refract(-uSunDirT, vec3(0.0, 1.0, 0.0), 1.0 / 1.33);
+  float sunPath = wdepth / max(-rsun.y, 0.1);
   diffuseColor.rgb *= exp(-uAbsorption * (sunPath * 0.6 + wdepth * 0.4));
 `;
 
+// Direct sun (spliced into three's light loop, one directional light): floater shadows
+// everywhere; below the surface the light arrives refracted (much steeper than the
+// grazing sun outside), dimmed by the Fresnel transmission, and both shadow maps are
+// read where it came through the surface, so the bed isn't shadowed along the
+// unrefracted ray by every sand bar up-sun.
+const SUN = /* glsl */`
+    getDirectionalLightInfo( directionalLight, directLight );
+    float under = smoothstep(0.05, -0.25, vWPos.y);
+    vec3 shadowAt = vWPos + vWNrm * 0.04;
+    bool viaSurface = false;
+    if (under > 0.0) {
+      vec3 rsun = refract(-uSunDirT, vec3(0.0, 1.0, 0.0), 1.0 / 1.33);
+      viaSurface = rsun.y < -0.05 && under > 0.5;
+      if (viaSurface) shadowAt = vec3(vWPos.x - rsun.x / rsun.y * vWPos.y, 0.05, vWPos.z - rsun.z / rsun.y * vWPos.y);
+      directLight.direction = normalize(mix(directLight.direction, (viewMatrix * vec4(-rsun, 0.0)).xyz, under));
+      float Ft = 0.02 + 0.98 * pow(1.0 - max(uSunDirT.y, 0.0), 5.0);
+      directLight.color *= 1.0 - Ft * under;
+    }
+    directLight.color *= floatShadow(shadowAt);
+#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+    vec4 sunShadowCoord = viaSurface ? uSunShadowMatrix * vec4(shadowAt, 1.0) : vDirectionalShadowCoord[ 0 ];
+#endif
+`;
+const LIGHTS_BEGIN = THREE.ShaderChunk.lights_fragment_begin
+  .replace('getDirectionalLightInfo( directionalLight, directLight );', SUN)
+  .replace('vDirectionalShadowCoord[ i ]', 'sunShadowCoord');
+
 const ROUGH = /* glsl */`
-  roughnessFactor = mix(roughnessFactor, 0.32, wet * step(0.0, hgt));
+  roughnessFactor = mix(mix(roughnessFactor, 0.32, wet * step(0.0, hgt)), 0.06, film);
 `;
 
+// caustics focused by the actual waves (Caustics.js); mean 1, so they only redistribute
+// the direct sun
 const CAUSTICS = /* glsl */`
-  if (wdepth > 0.0) {
-    vec3 rs = refract(-uSunDirT, vec3(0.0, 1.0, 0.0), 0.75);
-    vec2 base = vWPos.xz + rs.xz / rs.y * wdepth;   // where this light entered the surface
-    float c1 = texture(uCaustics, base * 0.19 + uTimeT * vec2(0.021, 0.013)).r;
-    float c2 = texture(uCaustics, base * 0.23 + vec2(0.37, 0.71) - uTimeT * vec2(0.017, 0.023)).r;
-    float c = min(c1, c2) * 2.5;
-    float fade = smoothstep(0.0, 0.5, wdepth) * exp(-wdepth * 0.11);
-    reflectedLight.directDiffuse *= 1.0 + c * fade * uCausticStrength;
+  if (wdepth > 0.0 && rsun.y < -0.05) {
+    vec2 entry = vWPos.xz + rsun.xz / rsun.y * wdepth;   // where this light entered the surface
+    vec2 fwc = fwidth(entry);
+    float c = waveCaustic(entry, wdepth, log2(max(max(fwc.x, fwc.y) * CAUSTIC_TEXELS_PER_M, 1.0)));
+    reflectedLight.directDiffuse *= max(mix(1.0, c, uCausticStrength), 0.0);
   }
 `;
 
@@ -126,6 +180,7 @@ function patch(material, uniforms, mode) {
       .replace('#include <map_fragment>', '#include <map_fragment>\n' + (ground ? ALBEDO : '') + UNDERWATER)
       .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n' + (ground ? ROUGH : ''))
       .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n' + (ground ? RIPPLES : ''))
+      .replace('#include <lights_fragment_begin>', LIGHTS_BEGIN)
       .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + CAUSTICS)
       .replace('#include <opaque_fragment>', FOG + '#include <opaque_fragment>');
   };
@@ -173,14 +228,17 @@ function placeRocks(count, rand) {
   return out;
 }
 
-export function createTerrain({ sky, caustics, absorption, reflectionLayer = 1 }) {
+export function createTerrain({ sky, caustics, floatShadow, water, absorption, reflectionLayer = 1 }) {
   const uniforms = {
-    uCaustics: { value: caustics },
+    ...floatShadow,
+    // shore maps + wave settings for the swash (same objects as the water's)
+    ...Object.fromEntries(['uShore', 'uTravel', 'uShoreExtent', 'uTime', 'uShoreWave', 'uSwellDir'].map((k) => [k, water[k]])),
+    ...caustics,
     uSkyCube: { value: sky.cube },
     uAbsorption: { value: absorption },
     uSunDirT: { value: sky.sunDir },
-    uTimeT: { value: 0 },
-    uCausticStrength: { value: 3.0 },
+    uSunShadowMatrix: { value: new THREE.Matrix4() },   // the sun light's shadow.matrix (main.js)
+    uCausticStrength: { value: 1.0 },
     uFogDensity: { value: 1 / 18000 },
   };
 

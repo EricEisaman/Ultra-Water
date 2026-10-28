@@ -17,7 +17,8 @@ export class PlanarReflection {
     this.camera = new THREE.PerspectiveCamera();
     this.camera.layers.set(layer);
     this.textureMatrix = new THREE.Matrix4();
-    this.target = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, generateMipmaps: false });
+    // mipmapped: the water blurs it by its roughness
+    this.target = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter });
     this.scale = 0.5;
   }
 

@@ -14,8 +14,12 @@ import { GpuTimer } from './engine/gpuTimer.js';
 import { FullscreenQuad, rawPass } from './engine/fullscreen.js';
 import { WaterQuery } from './water/WaterQuery.js';
 import { UnderwaterPass } from './water/UnderwaterPass.js';
+import { Spray } from './water/Spray.js';
+import { MarineSnow } from './water/MarineSnow.js';
 import { Floaters } from './scene/floaters.js';
 import { FLOATER_KINDS } from './scene/floaterMeshes.js';
+import { FloaterShadow } from './scene/floaterShadow.js';
+import { WaveCaustics } from './water/Caustics.js';
 
 const REFLECT_LAYER = 1;
 
@@ -39,14 +43,17 @@ const sky = new SkySystem(renderer);
 const shore = bakeShoreMap(islandHeight, 1800, 512);
 const tex = bakeWaterTextures(renderer);
 const ocean = new OceanSim(renderer, defaultOceanParams());
-const surface = new OceanSurface(ocean, shore, sky);
+const caustics = new WaveCaustics(renderer, ocean);
+const floatShadow = new FloaterShadow();
+const surface = new OceanSurface(ocean, shore, sky, floatShadow.uniforms);
 surface.uniforms.uFoamTex.value = tex.foam;
 
 const scene = new THREE.Scene();
 scene.environment = sky.cube;
 scene.add(sky.background);
 const terrain = createTerrain({
-  sky, caustics: tex.caustics, absorption: surface.uniforms.uAbsorption.value, reflectionLayer: REFLECT_LAYER,
+  sky, caustics: caustics.uniforms, floatShadow: floatShadow.uniforms, water: surface.uniforms,
+  absorption: surface.uniforms.uAbsorption.value, reflectionLayer: REFLECT_LAYER,
 });
 scene.add(terrain.group);
 
@@ -57,13 +64,15 @@ Object.assign(sunLight.shadow.camera, { left: -900, right: 900, top: 900, bottom
 sunLight.shadow.bias = -0.0004;
 sunLight.shadow.normalBias = 0.6;
 scene.add(sunLight, sunLight.target);
-surface.uniforms.uShadowMatrix.value = sunLight.shadow.matrix;
+surface.uniforms.uShadowMatrix.value = terrain.uniforms.uSunShadowMatrix.value = sunLight.shadow.matrix;
+surface.uniforms.uShadowBias.value = 0.05 / (sunLight.shadow.camera.far - sunLight.shadow.camera.near);
 
 // buoyancy: slot 0 of every water query is the camera (underwater test), then floaters
 const query = new WaterQuery(renderer, surface, 512);
 const floaters = new Floaters({ scene, heightAt: islandHeight, patchMaterial: terrain.patchProp });
-const underwater = new UnderwaterPass(surface, camera, tex.caustics);
-let camWater = 0, uwGain = 1;
+const underwater = new UnderwaterPass(surface, camera, caustics.uniforms);
+let camWater = 0, wasSubmerged = false, uwComp = 1;
+const look = { underwater: 0.55 };   // exposure compensation under water (auto exposure lifts it to milk otherwise)
 
 const reflection = new PlanarReflection(REFLECT_LAYER);
 surface.uniforms.uReflMatrix.value = reflection.textureMatrix;
@@ -83,13 +92,13 @@ out vec4 outColor;
 void main() { outColor = texture(uTex, vUv); }`, { uTex: { value: null } }));
 restore.mesh.renderOrder = -1;
 if (/OculusBrowser/.test(navigator.userAgent)) waterScene.add(restore.mesh);
-waterScene.add(surface.mesh);
+const spray = new Spray(surface, shore);
+const snow = new MarineSnow(surface);
+waterScene.add(surface.mesh, spray.mesh, spray.splash, snow.mesh);
 
 const post = new PostFX(renderer);
 post.params.bloomStrength = 0.05;
 post.params.bloomThreshold = 1.5;
-const look = { exposure: 0.55, underwater: 3 };
-let exposureBase = 1;
 
 let hdrRT = null;
 function makeTargets() {
@@ -125,15 +134,7 @@ function applySun() {
   sunLight.color.setRGB(sky.sunColor.x, sky.sunColor.y, sky.sunColor.z).multiplyScalar(1 / Math.max(sky.sunColor.x, 1e-4));
   sunLight.intensity = Math.PI * Math.max(sky.sunColor.x, 1e-4);
   renderer.shadowMap.needsUpdate = true;
-  updateExposure();
   sunDirty = false;
-}
-
-// crude auto-exposure from horizontal sun + sky irradiance, so noon isn't blown out
-function updateExposure() {
-  const c = sky.sunColor, lum = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
-  const E = Math.PI * Math.max(lum, 0.05) * (Math.max(sky.sunDir.y, 0) + 0.25);
-  exposureBase = look.exposure * 2.2 / Math.pow(E, 0.85);
 }
 
 // --- camera presets -----------------------------------------------------------------
@@ -203,7 +204,7 @@ const views = {
 let fSun = null;
 // --- GUI -----------------------------------------------------------------------
 const gui = new GUI({ title: 'Gelatin Water' });
-const ui = { view: 'Golden hour', benchmark: () => runBenchmark() };
+const ui = { view: 'Golden hour', benchmark: () => runBenchmark(), exposure: 1 };
 gui.add(ui, 'view', Object.keys(views)).name('camera').onChange((v) => views[v]());
 gui.add(ui, 'benchmark').name('benchmark (uncapped)');
 
@@ -234,6 +235,8 @@ fShore.add(shoreUi, 'amplitude', 0, 1.5, 0.01).onChange(setShore);
 fShore.add(shoreUi, 'wavelength', 8, 60, 0.5).onChange(setShore);
 fShore.add(shoreUi, 'speed', 0.3, 2, 0.01).onChange(setShore);
 fShore.add(shoreUi, 'steepness', 0, 1.5, 0.01).onChange(setShore);
+fShore.add(spray.params, 'amount', 0, 3, 0.01).name('spray');
+fShore.add(spray.params, 'size', 0.2, 3, 0.01).name('spray size');
 
 const fWater = gui.addFolder('Water');
 const w = {
@@ -265,7 +268,7 @@ fWater.add(w, 'foamBias', -0.5, 1.5, 0.01).onChange(setWater);
 fWater.add(w, 'foamScale', 0, 6, 0.01).onChange(setWater);
 fWater.add(w, 'foamRecovery', 0.05, 3, 0.01).onChange(setWater);
 fWater.add(w, 'shoreFoamBand', 0, 2, 0.01).onChange(setWater);
-fWater.add(w, 'caustics', 0, 8, 0.01).onChange(setWater);
+fWater.add(w, 'caustics', 0, 2, 0.01).onChange(setWater);
 fWater.add(su.uGlint, 'value', 0, 1, 0.01).name('glitter');
 
 const fFloat = gui.addFolder('Floaters & underwater');
@@ -288,10 +291,12 @@ fFloat.add(underwater.params, 'scattering', 0, 0.2, 0.001);
 fFloat.add(underwater.params, 'shafts', 0, 4, 0.01);
 fFloat.add(underwater.params, 'shaftRange', 5, 120, 1);
 fFloat.add(underwater.params, 'meniscus', 0, 1, 0.01);
-fFloat.add(look, 'underwater', 0.5, 4, 0.01).name('underwater exposure');
+fFloat.add(look, 'underwater', 0.2, 2, 0.01).name('underwater exposure');
 
 const fPost = gui.addFolder('Post');
-fPost.add(look, 'exposure', 0.1, 4, 0.01).name('exposure comp').onChange(updateExposure);
+fPost.add(ui, 'exposure', 0.25, 4, 0.01).name('exposure comp');
+fPost.add(post.params, 'autoExposure');
+fPost.add(post.params, 'keyValue', 0.05, 0.6, 0.01);
 fPost.add(post.params, 'bloomStrength', 0, 0.5, 0.001);
 fPost.add(post.params, 'bloomThreshold', 0, 10, 0.01);
 fPost.add(post.params, 'contrast', 0.7, 1.6, 0.01);
@@ -318,18 +323,33 @@ function renderFrame(dt) {
   if (query.resultCount > 0) camWater = query.result[0];
   floaters.ingest(query, 1);
   floaters.step(dt);
+  timer.begin('floatShadow');
+  floatShadow.update(renderer, floaters.scene, floaters.bodies, sky.sunDir);
+  // water entries -> ripple rings + splash (ages on the floaters' clock)
+  for (let i = 0; i < 8; i++) {
+    const e = floaters.impacts[i], age = e ? floaters.time - e.t : 1e9;
+    su.uImpact.value[i].set(e?.x ?? 0, e?.z ?? 0, age, age < 30 ? e.amp : 0);
+    su.uImpactSize.value[i] = e?.size ?? 1;
+  }
 
   ocean.update(dt, timer);
+  timer.begin('caustics');
+  caustics.update(sky.sunDir);
   surface.update(camera, elapsed % 3600);
-  terrain.uniforms.uTimeT.value = elapsed % 3600;
+  spray.update();
+  timer.begin('query');
   const pts = floaters.collectPoints([camera.position]);
   query.submit(pts, floaters.count, floaters.layout, elapsed);
 
   const camY = camera.position.y;
   const submerged = camY < camWater - 0.3, nearSurface = camY < camWater + 1.2;
   su.uCamSide.value = camY > camWater + 0.5 ? -1 : camY < camWater - 0.5 ? 1 : 0;
-  uwGain += ((submerged ? look.underwater : 1) - uwGain) * Math.min(1, dt * 4);
-  post.params.exposure = exposureBase * uwGain;
+  snow.update(camera, hdrRT.height, nearSurface);
+  uwComp += ((submerged ? look.underwater : 1) - uwComp) * Math.min(1, dt * 3);
+  post.params.exposure = ui.exposure * uwComp;
+  // water on the lens for a few seconds after surfacing
+  post.params.droplets = wasSubmerged && !submerged ? 1 : submerged ? 0 : Math.max(0, post.params.droplets - dt / 5);
+  wasSubmerged = submerged;
 
   timer.begin('reflection');
   if (quality.reflections && !submerged) {
@@ -356,7 +376,7 @@ function renderFrame(dt) {
   }
 
   timer.begin('post');
-  post.render(frame);
+  post.render(frame, dt);
   timer.endFrame();
 }
 
@@ -402,7 +422,7 @@ async function runBenchmark(frames = 300) {
 }
 window.runBenchmark = runBenchmark;
 window.app = {
-  camera, controls, sky, post, surface, ocean, terrain, timer, views, quality, renderer, floaters, query, underwater, look,
+  camera, controls, sky, post, surface, ocean, terrain, timer, views, quality, renderer, floaters, query, underwater, spray, snow, caustics, floatShadow,
   camWater: () => camWater, markSun: () => (sunDirty = true),
 };
 
