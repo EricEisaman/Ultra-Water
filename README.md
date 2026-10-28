@@ -128,3 +128,7 @@ Camera presets `Flotsam` and `Underwater` spawn a field of floating props. The `
 - The surface mesh is a fan inside 1 m of the camera, so detail right at the lens is coarse when sitting on the waterline.
 
 The design was argued out with a second agent before building, and again for each round of upgrades.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
