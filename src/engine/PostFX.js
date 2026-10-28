@@ -78,6 +78,7 @@ uniform sampler2D tHdr;
 uniform sampler2D tBloom;
 uniform float uExposure;
 uniform float uBloom;
+uniform vec2 uLook; // AgX look: power (contrast), saturation
 
 const mat3 SRGB_TO_REC2020 = mat3(
   vec3(0.6274, 0.0691, 0.0164), vec3(0.3293, 0.9195, 0.0880), vec3(0.0433, 0.0113, 0.8956));
@@ -102,7 +103,12 @@ vec3 agxContrast(vec3 x) {
 vec3 agx(vec3 c) {
   c = AGX_INSET * (SRGB_TO_REC2020 * c);
   c = clamp((log2(max(c, 1e-10)) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV), 0.0, 1.0);
-  c = AGX_OUTSET * agxContrast(c);
+  c = agxContrast(c);
+  // AgX "punchy"-style look in the encoded domain
+  c = pow(max(c, 0.0), vec3(uLook.x));
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  c = l + uLook.y * (c - l);
+  c = AGX_OUTSET * c;
   return clamp(REC2020_TO_SRGB * pow(max(c, 0.0), vec3(2.2)), 0.0, 1.0);
 }
 
@@ -119,7 +125,7 @@ const mk = (frag, uniforms, defines = {}, extra = {}) => new THREE.RawShaderMate
 });
 
 export class PostFX {
-  params = { exposure: 1.0, bloomStrength: 0.06, bloomThreshold: 1.0, bloomClamp: 64.0 };
+  params = { exposure: 1.0, bloomStrength: 0.06, bloomThreshold: 1.0, bloomClamp: 64.0, contrast: 1.12, saturation: 1.3 };
 
   constructor(renderer) {
     this.renderer = renderer;
@@ -138,7 +144,7 @@ export class PostFX {
       blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
     });
     this.matComp = mk(COMP, {
-      tHdr: { value: null }, tBloom: { value: null }, uExposure: { value: 1 }, uBloom: { value: 0 },
+      tHdr: { value: null }, tBloom: { value: null }, uExposure: { value: 1 }, uBloom: { value: 0 }, uLook: { value: new THREE.Vector2(1, 1) },
     });
 
     // levels[i] is 1/2^(i+1) of the input; texel[0] is the HDR input, texel[i+1] is levels[i]
@@ -199,6 +205,7 @@ export class PostFX {
     u.tHdr.value = hdrTexture;
     u.tBloom.value = L[0].texture;
     u.uExposure.value = p.exposure;
+    u.uLook.value.set(p.contrast, p.saturation);
     u.uBloom.value = p.bloomStrength;
     this._pass(this.matComp, null);
 

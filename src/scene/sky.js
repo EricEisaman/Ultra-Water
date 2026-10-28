@@ -37,7 +37,7 @@ export class SkySystem {
     this.cubeSize = CUBE_SIZE;
     this.sunDir = new THREE.Vector3(0, 1, 0);
     this.sunColor = new THREE.Vector3(1, 1, 1);
-    this.params = { elevation: 6, azimuth: 205, turbidity: 2, rayleigh: 1, cloudCoverage: 0.38, sunIntensity: 7 };
+    this.params = { elevation: 3.5, azimuth: 205, turbidity: 2, rayleigh: 1, cloudCoverage: 0.38, sunIntensity: 9 };
 
     this.sky = new Sky();
     this.sky.scale.setScalar(100);
@@ -82,7 +82,8 @@ export class SkySystem {
     // sun irradiance through the atmosphere: Kasten-Young air mass, per-channel extinction
     const e = Math.max(p.elevation, 0);
     const airmass = 1 / (Math.sin(THREE.MathUtils.degToRad(e)) + 0.50572 * Math.pow(e + 6.07995, -1.6364));
-    const tau = [0.032, 0.075, 0.19].map((t) => t * (0.6 + 0.12 * p.turbidity));
+    // Rayleigh optical depth at 680/550/450 nm + aerosols scaled by turbidity
+    const tau = [0.04, 0.097, 0.22].map((t, i) => t + 0.05 * p.turbidity * [0.8, 1, 1.2][i]);
     const fade = THREE.MathUtils.smoothstep(p.elevation, -2, 2);
     this.sunColor.set(...tau.map((t) => Math.exp(-t * airmass) * p.sunIntensity * fade));
 

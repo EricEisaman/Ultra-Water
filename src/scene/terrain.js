@@ -49,6 +49,27 @@ const ALBEDO = /* glsl */`
   diffuseColor.rgb = albedo;
 `;
 
+// sand ripples + grain bump in world space, faded out before they alias
+const RIPPLES = /* glsl */`
+#ifndef ROCK
+  {
+    vec2 fw = fwidth(vWPos.xz);
+    float px = max(fw.x, fw.y);
+    float sandMask = (1.0 - smoothstep(sandLine - 0.5, sandLine + 0.5, hgt)) * smoothstep(0.85, 0.95, flat_);
+    sandMask *= mix(1.0, 0.25, smoothstep(-0.3, 0.6, hgt)); // dry sand: faint wind ripples only
+    vec2 g = vec2(0.0);
+    // long wave-formed ripples (~1.6 m) and short ones (~0.3 m), bent by noise
+    vec2 d1 = normalize(vec2(0.8, 0.6) + (vec2(tn(vWPos.xz * 0.02), tn(vWPos.xz * 0.02 + 5.0)) - 0.5));
+    float w1 = 3.9, p1 = dot(vWPos.xz, d1) * w1 + tn(vWPos.xz * 0.11) * 5.0;
+    g += d1 * w1 * cos(p1) * 0.025 * (1.0 - smoothstep(0.15, 0.5, px));
+    float w2 = 21.0, p2 = dot(vWPos.xz, vec2(-d1.y, d1.x) * 0.3 + d1) * w2 + tn(vWPos.xz * 0.5) * 4.0;
+    g += d1 * w2 * cos(p2) * 0.0025 * (1.0 - smoothstep(0.03, 0.09, px));
+    vec3 nW = normalize(vWNrm - vec3(g.x, 0.0, g.y) * sandMask);
+    normal = normalize((viewMatrix * vec4(nW, 0.0)).xyz);
+  }
+#endif
+`;
+
 const UNDERWATER = /* glsl */`
   float wdepth = max(-vWPos.y, 0.0);
   // sun and sky light reaching the bed through the water column
@@ -99,6 +120,7 @@ function patch(material, uniforms, isRock) {
       .replace('#include <common>', '#include <common>\n' + FRAG_PARS)
       .replace('#include <map_fragment>', '#include <map_fragment>\n' + ALBEDO + UNDERWATER)
       .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n' + ROUGH)
+      .replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n' + RIPPLES)
       .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + CAUSTICS)
       .replace('#include <opaque_fragment>', FOG + '#include <opaque_fragment>');
   };

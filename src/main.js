@@ -137,7 +137,7 @@ function setSun(elevation, azimuth) {
 }
 const views = {
   'Golden hour': () => {
-    setSun(6, 205);
+    setSun(3.5, 205);
     const b = sunBearing(), c = coast(THREE.MathUtils.radToDeg(b) + 18);
     camera.position.set(c.x + Math.cos(b) * 120, 5, c.y + Math.sin(b) * 120);
     controls.target.set(c.x + Math.cos(b) * 400, 0, c.y + Math.sin(b) * 400);
@@ -233,11 +233,14 @@ fWater.add(w, 'foamScale', 0, 6, 0.01).onChange(setWater);
 fWater.add(w, 'foamRecovery', 0.05, 3, 0.01).onChange(setWater);
 fWater.add(w, 'shoreFoamBand', 0, 2, 0.01).onChange(setWater);
 fWater.add(w, 'caustics', 0, 8, 0.01).onChange(setWater);
+fWater.add(su.uGlint, 'value', 0, 1, 0.01).name('glitter');
 
 const fPost = gui.addFolder('Post');
 fPost.add(look, 'exposure', 0.1, 4, 0.01).name('exposure comp').onChange(updateExposure);
 fPost.add(post.params, 'bloomStrength', 0, 0.5, 0.001);
 fPost.add(post.params, 'bloomThreshold', 0, 10, 0.01);
+fPost.add(post.params, 'contrast', 0.7, 1.6, 0.01);
+fPost.add(post.params, 'saturation', 0, 2, 0.01);
 
 const fQ = gui.addFolder('Quality');
 fQ.add(quality, 'resolution', 0.25, 1, 0.05).onFinishChange(resize);
@@ -300,7 +303,8 @@ function runBenchmark(frames = 400) {
   sync();
   const ms = (performance.now() - t0) / frames;
   timing = true;
-  bench = `benchmark: ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps uncapped (${frames} frames)`;
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  bench = `benchmark ${size.x}×${size.y}: ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps uncapped`;
   console.log(bench);
   return ms;
 }
@@ -320,7 +324,8 @@ function updateHud(now) {
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
   let text = `${gpuInfo}\n${size.x}×${size.y}  MSAA ${quality.msaa}x  display fps ${fps.toFixed(0)}`;
   if (timer.available && timer.total > 0) {
-    text += `\nGPU ${timer.total.toFixed(2)} ms -> ${(1000 / timer.total).toFixed(0)} fps GPU-bound`;
+    // at vsync the GPU downclocks, so these read high; the benchmark is the real number
+    text += `\nGPU timers ${timer.total.toFixed(2)} ms (vsync-idle clocks)`;
     for (const [k, v] of Object.entries(timer.ms)) text += `\n  ${k.padEnd(10)} ${v.toFixed(3)} ms`;
   } else text += '\n(GPU timer queries unavailable; use benchmark)';
   if (bench) text += `\n${bench}`;
@@ -345,3 +350,4 @@ applySun();
 views[ui.view]();
 controls.update();
 requestAnimationFrame(loop);
+setTimeout(() => runBenchmark(), 3000);

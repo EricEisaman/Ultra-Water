@@ -78,9 +78,9 @@ vec3 cascadeDamp(float depth) {
 // Travelling breakers driven by the coast SDF: phase = k*sdf + wt, so fronts run up the
 // distance gradient towards the beach. Gerstner push along -grad(sdf), Green's-law
 // shoaling, breaking limit A <= 0.42*depth.
-struct Shore { vec3 disp; vec2 slope; float foam; };
+struct Shore { vec3 disp; vec2 slope; float foam; vec2 foamUV; };
 Shore shoreWaves(vec2 xz, vec4 sh) {
-  Shore o = Shore(vec3(0.0), vec2(0.0), 0.0);
+  Shore o = Shore(vec3(0.0), vec2(0.0), 0.0, vec2(0.0));
   float depth = -sh.x, sdf = sh.y;
   float gl = length(sh.zw);
   float env = smoothstep(180.0, 70.0, sdf) * smoothstep(0.35, 0.8, gl) * smoothstep(-0.9, 0.5, depth);
@@ -109,7 +109,14 @@ Shore shoreWaves(vec2 xz, vec4 sh) {
     // whitewater: on the crest and trailing behind it once the wave is near breaking
     float breaking = smoothstep(0.18, 0.4, a / max(depth, 0.05));
     float psi = mod(ph + PI, 2.0 * PI) - PI;
-    o.foam += breaking * smoothstep(-0.45, 0.0, psi) * exp(-max(psi, 0.0) * 0.8);
+    float f = breaking * smoothstep(-0.45, 0.0, psi) * exp(-max(psi, 0.0) * 0.8);
+    o.foam += f;
+    // foam texture rides with the bore: -psi/k is the coordinate in the frame moving at
+    // phase speed; each wave cycle gets its own random offset (the wrap sits where foam ~ 0)
+    if (i == 0) {
+      float cycle = floor((ph + PI) / (2.0 * PI));
+      o.foamUV = vec2(dot(xz, vec2(-dir.y, dir.x)), -psi / k) + vec2(hash12(vec2(cycle, 3.7)), hash12(vec2(cycle, 9.1))) * 50.0;
+    }
   }
   return o;
 }
@@ -165,6 +172,7 @@ uniform vec4 uFoam;         // bias, scale, shore band (m), brightness
 uniform vec4 uOptics;       // base roughness, refraction strength, reflection distortion, fog density
 uniform vec3 uCamForward;
 uniform int uDebug;
+uniform float uGlint;
 in vec3 vWorld;
 in vec2 vXZ;
 out vec4 fragColor;
@@ -237,7 +245,7 @@ void main() {
   // shoreline contact foam where the water gets thin
   float contact = 1.0 - smoothstep(0.0, uFoam.z, thick * viewCos);
   foam = max(foam, contact * 0.9);
-  foam = max(foam, clamp(shore.foam, 0.0, 1.0));
+  float shoreFoam = clamp(shore.foam, 0.0, 1.0);
 
   // --- lighting ------------------------------------------------------------------
   vec3 ambient = skyLod(vec3(0.0, 1.0, 0.0), uSkyMaxLod);
@@ -277,12 +285,38 @@ void main() {
   float Fs = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, H), 0.0), 5.0);
   vec3 spec = sun * (PI * D * vis * Fs * nl);
 
+  // stochastic glitter: where facets are sub-pixel the averaged lobe is broken into
+  // sparse twinkling sparkles. Mean of mask is 1, so energy is preserved.
+  if (uGlint > 0.0) {
+    vec2 fw = fwidth(vXZ);
+    float lf = log2(max(max(fw.x, fw.y), 1e-3)) + 1.0;
+    float l0 = floor(lf);
+    float m = 0.0;
+    for (int j = 0; j < 2; j++) {
+      float l = l0 + float(j);
+      vec2 cell = floor(vXZ / exp2(l));
+      float hr = hash12(cell + l * 17.17);
+      float h = hash12(cell * 1.31 + floor(uTime * 5.0 + hr * 7.0) * 3.7);
+      m += (j == 0 ? 1.0 - (lf - l0) : lf - l0) * step(0.82, h) / 0.18;
+    }
+    // only the bright glitter path sparkles; dim sheen stays smooth instead of grainy
+    float bright = smoothstep(1.5, 12.0, dot(spec, vec3(0.2126, 0.7152, 0.0722)));
+    spec *= mix(1.0, m, uGlint * bright * smoothstep(15.0, 120.0, dist));
+  }
+
   vec3 col = mix(body, refl, F) + spec;
 
   // --- foam surface: eroded by age via the pattern threshold, kills specular ----------
+  // erosion: dense foam is nearly solid, ageing foam thins out to the lace network
   float pattern = texture(uFoamTex, vXZ * 0.11).r * 0.65 + texture(uFoamTex, vXZ * 0.031 + 0.37).r * 0.35;
-  float cover = smoothstep(1.0 - foam, 1.0 - foam + 0.25, pattern) * foam;
-  vec3 foamCol = uFoam.w * (sun * max(NoL, 0.0) * 0.9 + ambient * 1.1);
+  float cover = smoothstep(1.05 - foam, 1.3 - foam, pattern) * sqrt(foam);
+  float sPattern = texture(uFoamTex, shore.foamUV * 0.09).r * 0.7 + texture(uFoamTex, shore.foamUV * 0.023 + 0.5).r * 0.3;
+  float sCover = smoothstep(1.0 - shoreFoam, 1.25 - shoreFoam, sPattern) * sqrt(shoreFoam);
+  float pat = mix(pattern, sPattern, step(cover, sCover));
+  cover = max(cover, sCover);
+  // thin foam lets the water colour through and looks bluish; thick foam is bright
+  vec3 foamAlbedo = mix(vec3(0.62, 0.78, 0.82), vec3(0.95), smoothstep(0.3, 0.9, pat));
+  vec3 foamCol = uFoam.w * foamAlbedo * (sun * (0.35 + 0.65 * max(NoL, 0.0)) + ambient * 1.1);
   col = mix(col, foamCol, cover);
 
   // --- aerial perspective into the horizon sky ---------------------------------------
@@ -291,7 +325,7 @@ void main() {
 
   if (uDebug == 1) col = Nrm * 0.5 + 0.5;
   else if (uDebug == 2) col = spec;
-  else if (uDebug == 3) col = vec3(foam, cover, shore.foam);
+  else if (uDebug == 3) col = vec3(foam, cover, shoreFoam);
   else if (uDebug == 4) col = vec3(alpha * 5.0, sqrt(geoVar) * 5.0, sqrt(variance.x + variance.y) * 5.0);
   else if (uDebug == 5) col = vec3(F);
   else if (uDebug == 6) col = body;
@@ -335,6 +369,7 @@ export class OceanSurface {
       uOptics: { value: new THREE.Vector4(0.02, 0.06, 0.04, 1 / 18000) },
       uCamForward: { value: new THREE.Vector3() },
       uDebug: { value: 0 },
+      uGlint: { value: 0.6 },
     };
     this.material = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
