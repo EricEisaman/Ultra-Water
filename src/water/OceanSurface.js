@@ -5,13 +5,17 @@ import { N } from './OceanSim.js';
 // screen density stays ~constant. Displacement is band-limited to the local vertex
 // spacing (textureLod), which is what kills swimming - no clipmap snapping needed.
 const ANGULAR = 384;
+const HIGH_CAMERA = 60;  // m: above this a half-density grid is used (waves there are sub-pixel)
 const INNER = 1;        // m, scaled by camera height
 const OUTER = 3000;     // m, then one flat skirt
 const SKIRT = 60000;
 
-function buildGrid() {
+function buildGrid(ANGULAR) {
   const q = 1 + (2 * Math.PI) / ANGULAR;
   const radii = [];
+  // a few coarser-ratio rings inside INNER so the surface right at the lens isn't one
+  // flat fan when the camera sits on the waterline
+  for (let r = INNER / 16; r < INNER * 0.99; r *= 1.12) radii.push(r);
   for (let r = INNER; r < OUTER; r *= q) radii.push(r);
   radii.push(SKIRT);
   const verts = new Float32Array((1 + radii.length * ANGULAR) * 3);
@@ -177,7 +181,6 @@ uniform float uSkyMaxLod;
 uniform sampler2D uFoamTex;
 uniform sampler2DShadow uShadowMap;
 uniform mat4 uShadowMatrix;
-uniform vec2 uShadowTexel;
 uniform vec3 uSunDir;
 uniform vec3 uSunColor;
 uniform vec3 uAbsorption;
@@ -201,10 +204,8 @@ float linearDepth(float d) {
 float sunShadow(vec3 p) {
   vec4 sc = uShadowMatrix * vec4(p, 1.0);
   if (sc.x <= 0.0 || sc.y <= 0.0 || sc.x >= 1.0 || sc.y >= 1.0 || sc.z >= 1.0) return 1.0;
-  float z = sc.z - 0.0015;
-  vec2 o = uShadowTexel * 1.5;
-  return 0.25 * (texture(uShadowMap, vec3(sc.xy + vec2(-o.x, -o.y), z)) + texture(uShadowMap, vec3(sc.xy + vec2(o.x, -o.y), z))
-               + texture(uShadowMap, vec3(sc.xy + vec2(-o.x, o.y), z)) + texture(uShadowMap, vec3(sc.xy + vec2(o.x, o.y), z)));
+  // one hardware 2x2 PCF tap: texels are ~0.44 m, soft enough on moving water
+  return texture(uShadowMap, vec3(sc.xy, sc.z - 0.0015));
 }
 
 vec3 skyLod(vec3 dir, float lod) {
@@ -351,16 +352,24 @@ void main() {
 
   // --- foam surface: eroded by age via the pattern threshold, kills specular ----------
   // erosion: dense foam is nearly solid, ageing foam thins out to the lace network
-  float pattern = texture(uFoamTex, vXZ * 0.11).r * 0.65 + texture(uFoamTex, vXZ * 0.031 + 0.37).r * 0.35;
-  float cover = smoothstep(1.05 - foam, 1.3 - foam, pattern) * sqrt(foam);
-  float sPattern = texture(uFoamTex, shore.foamUV * 0.09).r * 0.7 + texture(uFoamTex, shore.foamUV * 0.023 + 0.5).r * 0.3;
-  float sCover = smoothstep(1.0 - shoreFoam, 1.25 - shoreFoam, sPattern) * sqrt(shoreFoam);
-  float pat = mix(pattern, sPattern, step(cover, sCover));
-  cover = max(cover, sCover);
-  // thin foam lets the water colour through and looks bluish; thick foam is bright
-  vec3 foamAlbedo = mix(vec3(0.62, 0.78, 0.82), vec3(0.95), smoothstep(0.3, 0.9, pat));
-  vec3 foamCol = uFoam.w * foamAlbedo * (sun * (0.35 + 0.65 * max(NoL, 0.0)) + ambient * 1.1);
-  col = mix(col, foamCol, cover);
+  // (texture taps only where there is foam; most of the ocean has none)
+  float cover = 0.0, pat = 0.0;
+  if (foam > 0.0) {
+    pat = texture(uFoamTex, vXZ * 0.11).r * 0.65 + texture(uFoamTex, vXZ * 0.031 + 0.37).r * 0.35;
+    cover = smoothstep(1.05 - foam, 1.3 - foam, pat) * sqrt(foam);
+  }
+  if (shoreFoam > 0.0) {
+    float sPattern = texture(uFoamTex, shore.foamUV * 0.09).r * 0.7 + texture(uFoamTex, shore.foamUV * 0.023 + 0.5).r * 0.3;
+    float sCover = smoothstep(1.0 - shoreFoam, 1.25 - shoreFoam, sPattern) * sqrt(shoreFoam);
+    if (sCover >= cover) pat = sPattern;
+    cover = max(cover, sCover);
+  }
+  if (cover > 0.0) {
+    // thin foam lets the water colour through and looks bluish; thick foam is bright
+    vec3 foamAlbedo = mix(vec3(0.62, 0.78, 0.82), vec3(0.95), smoothstep(0.3, 0.9, pat));
+    vec3 foamCol = uFoam.w * foamAlbedo * (sun * (0.35 + 0.65 * max(NoL, 0.0)) + ambient * 1.1);
+    col = mix(col, foamCol, cover);
+  }
 
   // --- aerial perspective into the horizon sky ---------------------------------------
   float fog = 1.0 - exp(-dist * uOptics.w);
@@ -402,7 +411,6 @@ export class OceanSurface {
       uFoamTex: { value: null },
       uShadowMap: { value: null },
       uShadowMatrix: { value: new THREE.Matrix4() },
-      uShadowTexel: { value: new THREE.Vector2(1 / 2048, 1 / 2048) },
       uSunDir: { value: sky.sunDir },
       uSunColor: { value: sky.sunColor },
       uAbsorption: { value: new THREE.Vector3(0.42, 0.075, 0.048) },
@@ -422,7 +430,8 @@ export class OceanSurface {
       uniforms: this.uniforms,
       side: THREE.DoubleSide,
     });
-    this.mesh = new THREE.Mesh(buildGrid(), this.material);
+    this.grids = [buildGrid(ANGULAR), buildGrid(ANGULAR / 2)];
+    this.mesh = new THREE.Mesh(this.grids[0], this.material);
     this.mesh.frustumCulled = false;
   }
 
@@ -434,6 +443,9 @@ export class OceanSurface {
     const a = THREE.MathUtils.degToRad(s.params.swellDirection);
     u.uSwellDir.value.set(-Math.cos(a), -Math.sin(a));
     u.uGridScale.value = Math.max(1, Math.abs(camera.position.y) / 2);
+    const coarse = Math.abs(camera.position.y) > HIGH_CAMERA ? 1 : 0;
+    this.mesh.geometry = this.grids[coarse];
+    u.uCellStep.value = (2 * Math.PI) / (ANGULAR >> coarse);
     u.uNearFar.value.set(camera.near, camera.far);
     camera.getWorldDirection(u.uCamForward.value);
   }

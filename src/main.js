@@ -58,7 +58,6 @@ sunLight.shadow.bias = -0.0004;
 sunLight.shadow.normalBias = 0.6;
 scene.add(sunLight, sunLight.target);
 surface.uniforms.uShadowMatrix.value = sunLight.shadow.matrix;
-surface.uniforms.uShadowTexel.value.set(1 / 4096, 1 / 4096);
 
 // buoyancy: slot 0 of every water query is the camera (underwater test), then floaters
 const query = new WaterQuery(renderer, surface, 512);
@@ -71,8 +70,11 @@ surface.uniforms.uReflMatrix.value = reflection.textureMatrix;
 const emptyReflection = new THREE.DataTexture(new Uint8Array(4), 1, 1);
 emptyReflection.needsUpdate = true;
 
-// water pass: restore the resolved opaque colour into the MSAA buffer (three
-// invalidates it after resolve; depth survives), then draw water depth-tested.
+// water pass: draw into the same MSAA buffer, sampling the resolved opaque colour and
+// depth. three keeps the MSAA colour after a resolve except on the Oculus browser,
+// where it invalidates it; only there is the colour copied back first (costs ~0.5 ms
+// at 3.3 MP).
+const waterScene = new THREE.Scene();
 const restore = new FullscreenQuad(rawPass(/* glsl */`
 precision highp float;
 uniform sampler2D uTex;
@@ -80,8 +82,8 @@ in vec2 vUv;
 out vec4 outColor;
 void main() { outColor = texture(uTex, vUv); }`, { uTex: { value: null } }));
 restore.mesh.renderOrder = -1;
-const waterScene = new THREE.Scene();
-waterScene.add(restore.mesh, surface.mesh);
+if (/OculusBrowser/.test(navigator.userAgent)) waterScene.add(restore.mesh);
+waterScene.add(surface.mesh);
 
 const post = new PostFX(renderer);
 post.params.bloomStrength = 0.05;
@@ -297,7 +299,7 @@ fPost.add(post.params, 'saturation', 0, 2, 0.01);
 
 const fQ = gui.addFolder('Quality');
 fQ.add(quality, 'resolution', 0.25, 1, 0.05).onFinishChange(resize);
-fQ.add(quality, 'msaa', [0, 2, 4, 8]).onChange(makeTargets);
+fQ.add(quality, 'msaa', [2, 4, 8]).onChange(makeTargets);   // water samples the resolve, so MSAA is required
 fQ.add(quality, 'reflections');
 fQ.add(quality, 'reflectionScale', 0.25, 1, 0.05).onFinishChange(makeTargets);
 [fWave, fShore, fWater, fFloat, fPost].forEach((f) => f.close());
@@ -305,12 +307,12 @@ fQ.add(quality, 'reflectionScale', 0.25, 1, 0.05).onFinishChange(makeTargets);
 // --- frame ---------------------------------------------------------------------
 const gl = renderer.getContext();
 const timer = new GpuTimer(gl);
-let elapsed = 0, timing = true;
+let elapsed = 0;
 
 function renderFrame(dt) {
   elapsed += dt;
   if (sunDirty) applySun();
-  if (timing) timer.beginFrame();
+  timer.beginFrame();
 
   // latest water heights (1-3 frames old) drive the camera test and the floaters
   if (query.resultCount > 0) camWater = query.result[0];
@@ -343,7 +345,9 @@ function renderFrame(dt) {
 
   timer.begin('water');
   su.uShadowMap.value = sunLight.shadow.map.depthTexture;
+  hdrRT.resolveDepthBuffer = nearSurface;   // only the underwater pass needs depth with water
   renderer.render(waterScene, camera);
+  hdrRT.resolveDepthBuffer = true;
 
   let frame = hdrRT.texture;
   if (nearSurface) {
@@ -353,7 +357,7 @@ function renderFrame(dt) {
 
   timer.begin('post');
   post.render(frame);
-  if (timing) timer.endFrame();
+  timer.endFrame();
 }
 
 function clampCamera() {
@@ -362,21 +366,39 @@ function clampCamera() {
   if (camera.position.y < floor) camera.position.y = floor;
 }
 
-function runBenchmark(frames = 400) {
-  const px = new Uint8Array(4);
-  const sync = () => gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
-  timing = false;
+// Chrome/ANGLE's readPixels and finish don't wait for the GPU, so sync on a fence.
+async function gpuFence() {
+  const s = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+  gl.flush();
+  while (gl.clientWaitSync(s, 0, 0) === gl.TIMEOUT_EXPIRED) await new Promise((r) => setTimeout(r, 1));
+  gl.deleteSync(s);
+}
+
+// frames back-to-back (render loop paused), timed to GPU completion; also returns the
+// per-pass GPU times measured at full clocks
+let benchmarking = false;
+async function runBenchmark(frames = 300) {
+  if (benchmarking) return null;
+  benchmarking = true;
+  timer.drain();
   for (let i = 0; i < 20; i++) renderFrame(1 / 200);
-  sync();
+  await gpuFence();
+  timer.drain();
+  timer.keep = true;
   const t0 = performance.now();
   for (let i = 0; i < frames; i++) renderFrame(1 / 200);
-  sync();
+  await gpuFence();
   const ms = (performance.now() - t0) / frames;
-  timing = true;
+  const passes = timer.drain();
+  timer.keep = false;
+  benchmarking = false;
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
-  bench = `benchmark ${size.x}×${size.y}: ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps uncapped`;
+  const gpu = Object.values(passes).reduce((a, b) => a + b, 0);
+  bench = `benchmark ${size.x}×${size.y}: ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps uncapped (GPU ${gpu.toFixed(2)} ms)`
+    + Object.entries(passes).map(([k, v]) => `
+  ${k.padEnd(12)} ${v.toFixed(3)} ms`).join('');
   console.log(bench);
-  return ms;
+  return { ms, gpu, passes };
 }
 window.runBenchmark = runBenchmark;
 window.app = {
@@ -397,7 +419,7 @@ function updateHud(now) {
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
   let text = `${gpuInfo}\n${size.x}×${size.y}  MSAA ${quality.msaa}x  display fps ${fps.toFixed(0)}`;
   if (timer.available && timer.total > 0) {
-    // at vsync the GPU downclocks, so these read high; the benchmark is the real number
+    // at vsync the GPU downclocks, so these read high; the benchmark measures at full clocks
     text += `\nGPU timers ${timer.total.toFixed(2)} ms (vsync-idle clocks)`;
     for (const [k, v] of Object.entries(timer.ms)) text += `\n  ${k.padEnd(10)} ${v.toFixed(3)} ms`;
   } else text += '\n(GPU timer queries unavailable; use benchmark)';
@@ -410,6 +432,7 @@ function updateHud(now) {
 function loop(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
+  if (benchmarking) { requestAnimationFrame(loop); return; }
   controls.update();
   clampCamera();
   renderFrame(dt);

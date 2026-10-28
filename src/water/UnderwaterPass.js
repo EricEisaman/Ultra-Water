@@ -26,6 +26,7 @@ uniform vec3 uSunDir;
 uniform vec3 uSunColor;
 uniform vec4 uUnder;   // scattering coefficient (1/m), shaft strength, shaft range (m), meniscus darkening
 uniform float uFull;   // 1: camera deep enough that the whole near plane is submerged
+uniform float uFrame;  // frame index mod 64, rotates the shaft jitter
 in vec2 vUv;
 out vec4 outColor;
 
@@ -96,7 +97,9 @@ void main() {
     float range = min(dist, uUnder.z);
     const int STEPS = 8;
     float stepL = range / float(STEPS);
-    float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    // interleaved gradient noise, shifted by the golden ratio each frame: at high frame
+    // rates the per-pixel grain averages out instead of showing a fixed pattern
+    float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))) + uFrame * 0.618034);
     float mu = dot(dir, -rs);
     const float g = 0.7;
     float phase = (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * mu, 1.5)) + 0.04;
@@ -127,7 +130,7 @@ export class UnderwaterPass {
       ...surface.uniforms,
       tColor: { value: null }, tDepth: { value: null }, uCaustics: { value: caustics },
       uInvProj: { value: camera.projectionMatrixInverse }, uCamWorld: { value: camera.matrixWorld },
-      uUnder: { value: new THREE.Vector4() }, uFull: { value: 0 },
+      uUnder: { value: new THREE.Vector4() }, uFull: { value: 0 }, uFrame: { value: 0 },
     };
     this.quad = new FullscreenQuad(rawPass(FRAG, this.uniforms));
     this.target = null;
@@ -145,6 +148,7 @@ export class UnderwaterPass {
     u.tDepth.value = src.depthTexture;
     u.uUnder.value.set(p.scattering, p.shafts, p.shaftRange, p.meniscus);
     u.uFull.value = full ? 1 : 0;
+    u.uFrame.value = (u.uFrame.value + 1) % 64;
     this.quad.render(renderer, this.target);
     return this.target.texture;
   }

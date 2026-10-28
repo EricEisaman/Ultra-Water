@@ -8,6 +8,13 @@ export function buildTerrain(segments = 384, mapSize = 256) {
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) pos.setY(i, islandHeight(pos.getX(i), pos.getZ(i)));
+  // drop the deep seabed: below ~34 m the view through the water keeps <5% of it, so it
+  // was shading most of the screen in wide shots for nothing
+  const idx = geo.index.array, keep = [];
+  for (let t = 0; t < idx.length; t += 3) {
+    if (Math.max(pos.getY(idx[t]), pos.getY(idx[t + 1]), pos.getY(idx[t + 2])) > -34) keep.push(idx[t], idx[t + 1], idx[t + 2]);
+  }
+  geo.setIndex(keep);
   geo.computeVertexNormals();
   geo.computeBoundingSphere();
 

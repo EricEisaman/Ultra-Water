@@ -55,6 +55,7 @@ const RIPPLES = /* glsl */`
   {
     vec2 fw = fwidth(vWPos.xz);
     float px = max(fw.x, fw.y);
+    if (px < 0.5) {   // both ripple bands are faded out beyond this
     float sandMask = (1.0 - smoothstep(sandLine - 0.5, sandLine + 0.5, hgt)) * smoothstep(0.85, 0.95, flat_);
     sandMask *= mix(1.0, 0.25, smoothstep(-0.3, 0.6, hgt)); // dry sand: faint wind ripples only
     vec2 g = vec2(0.0);
@@ -66,6 +67,7 @@ const RIPPLES = /* glsl */`
     g += d1 * w2 * cos(p2) * 0.0025 * (1.0 - smoothstep(0.03, 0.09, px));
     vec3 nW = normalize(vWNrm - vec3(g.x, 0.0, g.y) * sandMask);
     normal = normalize((viewMatrix * vec4(nW, 0.0)).xyz);
+    }
   }
 #endif
 `;

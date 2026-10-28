@@ -66,7 +66,8 @@ export class SkySystem {
       }),
     );
     this.background.frustumCulled = false;
-    this.background.renderOrder = -1000;
+    // drawn after the opaque scene at the far plane, so only visible sky pixels shade
+    this.background.renderOrder = 1000;
   }
 
   update() {

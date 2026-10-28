@@ -35,6 +35,7 @@ export class GpuTimer {
     this.end();
     this.pending.push(this.frame);
     this.frame = null;
+    if (this.keep) return;     // benchmark: keep everything for drain()
     const gl = this.gl;
     const disjoint = gl.getParameter(this.ext.GPU_DISJOINT_EXT);
     while (this.pending.length) {
@@ -53,5 +54,18 @@ export class GpuTimer {
     }
     // ponytail: drop backlog if the GPU never reports (tab hidden etc.)
     if (this.pending.length > 8) this.pending.splice(0, this.pending.length - 8).flat().forEach(({ q }) => gl.deleteQuery(q));
+  }
+
+  // read every pending query (call after a GPU fence) -> mean ms per label per frame
+  drain() {
+    const gl = this.gl, sums = {};
+    const frames = this.pending.length;
+    for (const f of this.pending) for (const { label, q } of f) {
+      if (gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) sums[label] = (sums[label] || 0) + gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6;
+      gl.deleteQuery(q);
+    }
+    this.pending = [];
+    for (const k in sums) sums[k] /= frames;
+    return sums;
   }
 }

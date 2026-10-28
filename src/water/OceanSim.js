@@ -227,8 +227,11 @@ export class OceanSim {
       depthBuffer: false, generateMipmaps: false,
     };
     this.h0RT = new THREE.WebGLRenderTarget(N, N * 3, fft);
-    this.ping = new THREE.WebGLRenderTarget(N, N * 3, { ...fft, count: 2 });
-    this.pong = new THREE.WebGLRenderTarget(N, N * 3, { ...fft, count: 2 });
+    // the 16 IFFT stages are bandwidth-bound; fp16 halves that, and its ~1e-3 relative
+    // error is about a millimetre of displacement on the largest cascade
+    const half = { ...fft, type: THREE.HalfFloatType, count: 2 };
+    this.ping = new THREE.WebGLRenderTarget(N, N * 3, half);
+    this.pong = new THREE.WebGLRenderTarget(N, N * 3, half);
 
     const out = {
       type: THREE.HalfFloatType, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter,
