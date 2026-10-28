@@ -213,7 +213,7 @@ let fSun = null;
 // --- GUI -----------------------------------------------------------------------
 const gui = new GUI({ title: 'Gelatin Water' });
 if (mobile) gui.close();   // on phones the open panel covers most of the screen
-const ui = { view: 'Golden hour', benchmark: () => runBenchmark(), exposure: 1 };
+const ui = { view: 'Golden hour', benchmark: () => benchButton.click(), exposure: 1 };
 gui.add(ui, 'view', Object.keys(views)).name('camera').onChange((v) => views[v]());
 gui.add(ui, 'benchmark').name('benchmark (uncapped)');
 
@@ -475,6 +475,17 @@ uncapButton.onclick = () => {
   uncapButton.classList.toggle('on', uncapped);
   fpsHistory.length = 0;
 };
+// on request only: it freezes the screen for its 320 frames, which read as a hitch on load
+const benchButton = $('pBench');
+benchButton.onclick = async () => {
+  if (benchButton.disabled) return;
+  benchButton.disabled = true;
+  benchButton.textContent = 'Benchmarking…';
+  await new Promise((r) => requestAnimationFrame(() => setTimeout(r)));   // let the label paint first
+  await runBenchmark();
+  benchButton.disabled = false;
+  benchButton.textContent = 'Run benchmark';
+};
 
 function updateHud(now) {
   const fps = (frames * 1000) / (now - lastHud);
@@ -576,4 +587,3 @@ applySun();
 views[ui.view]();
 controls.update();
 requestAnimationFrame(loop);
-setTimeout(() => runBenchmark(), 3000);
