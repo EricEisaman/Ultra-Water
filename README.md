@@ -1,4 +1,4 @@
-# Gelatin Game Engine — Water
+# Ultra Water
 
 Real-time ocean renderer for three.js (WebGL2), with a demo island scene.
 
