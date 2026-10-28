@@ -32,7 +32,14 @@ renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.shadowMap.autoUpdate = false;
 document.body.appendChild(renderer.domElement);
 
-const quality = { resolution: 1, msaa: 4, reflections: true, reflectionScale: 0.5 };
+// one build: phones and tablets (a finger is the main pointer) start on a lighter profile,
+// measured on an Adreno 732 to hold 60 fps; ?mobile / ?desktop force either
+const args = new URLSearchParams(location.search);
+const mobile = args.has('mobile') || (!args.has('desktop') && matchMedia('(pointer: coarse)').matches);
+const quality = mobile
+  ? { resolution: 0.6, msaa: 2, reflections: true, reflectionScale: 0.35, autoResolution: true }
+  : { resolution: 1, msaa: 4, reflections: true, reflectionScale: 0.5 };
+document.body.classList.toggle('mobile', mobile);
 const camera = new THREE.PerspectiveCamera(50, 1, 0.5, 80000);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -99,6 +106,7 @@ waterScene.add(surface.mesh, spray.mesh, spray.splash, snow.mesh);
 const post = new PostFX(renderer);
 post.params.bloomStrength = 0.05;
 post.params.bloomThreshold = 1.5;
+if (mobile) post.params.bloomStrength = 0;   // its 12 passes cost a phone more than this faint glow is worth
 
 let hdrRT = null;
 function makeTargets() {
@@ -204,6 +212,7 @@ const views = {
 let fSun = null;
 // --- GUI -----------------------------------------------------------------------
 const gui = new GUI({ title: 'Gelatin Water' });
+if (mobile) gui.close();   // on phones the open panel covers most of the screen
 const ui = { view: 'Golden hour', benchmark: () => runBenchmark(), exposure: 1 };
 gui.add(ui, 'view', Object.keys(views)).name('camera').onChange((v) => views[v]());
 gui.add(ui, 'benchmark').name('benchmark (uncapped)');
@@ -327,7 +336,8 @@ fPost.add(post.params, 'contrast', 0.7, 1.6, 0.01);
 fPost.add(post.params, 'saturation', 0, 2, 0.01);
 
 const fQ = gui.addFolder('Quality');
-fQ.add(quality, 'resolution', 0.25, 1, 0.05).onFinishChange(resize);
+const resController = fQ.add(quality, 'resolution', 0.25, 1, 0.05).onFinishChange(resize);
+if (mobile) fQ.add(quality, 'autoResolution').name('auto resolution');
 fQ.add(quality, 'msaa', [2, 4, 8]).onChange(makeTargets);   // water samples the resolve, so MSAA is required
 fQ.add(quality, 'reflections');
 fQ.add(quality, 'reflectionScale', 0.25, 1, 0.05).onFinishChange(makeTargets);
@@ -438,7 +448,7 @@ async function runBenchmark(frames = 300) {
   benchmarking = false;
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
   const gpu = Object.values(passes).reduce((a, b) => a + b, 0);
-  bench = `benchmark ${size.x}×${size.y}: ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps uncapped (GPU ${gpu.toFixed(2)} ms)`
+  bench = `benchmark ${size.x}×${size.y}: ${ms.toFixed(2)} ms/frame = ${(1000 / ms).toFixed(0)} fps uncapped${timer.available ? ` (GPU ${gpu.toFixed(2)} ms)` : ''}`
     + Object.entries(passes).map(([k, v]) => `
   ${k.padEnd(12)} ${v.toFixed(3)} ms`).join('');
   console.log(bench);
@@ -461,7 +471,7 @@ const gpuInfo = (() => {
 function updateHud(now) {
   const fps = (frames * 1000) / (now - lastHud);
   const size = renderer.getDrawingBufferSize(new THREE.Vector2());
-  let text = `${gpuInfo}\n${size.x}×${size.y}  MSAA ${quality.msaa}x  display fps ${fps.toFixed(0)}`;
+  let text = `${gpuInfo}\n${size.x}×${size.y}  MSAA ${quality.msaa}x${mobile ? ' (mobile)' : ''}  display fps ${fps.toFixed(0)}`;
   if (timer.available && timer.total > 0) {
     // at vsync the GPU downclocks, so these read high; the benchmark measures at full clocks
     text += `\nGPU timers ${timer.total.toFixed(2)} ms (vsync-idle clocks)`;
@@ -473,10 +483,39 @@ function updateHud(now) {
   lastHud = now;
 }
 
+// mobile: hold 60 fps by stepping resolution down from the profile's, judged over 2 s
+// windows (a frame over 20 ms is a missed vsync), and back up once frames are clean again.
+// Still missing at the floor, render every other vsync for a steady 30.
+const auto = { n: -240, missed: 0, clean: 0, top: quality.resolution, cap30: false, odd: false };   // skip startup
+function autoResolution(ms) {
+  if (ms > 250) return;   // tab switch or benchmark, not load
+  if (++auto.n <= 0) return;
+  if (ms > (auto.cap30 ? 40 : 20)) auto.missed++;
+  if (auto.n < 120 || auto.cap30) return;
+  const r = quality.resolution, miss = auto.missed / auto.n;
+  auto.n = auto.missed = 0;
+  if (miss > 0.04) {
+    auto.clean = 0;
+    if (r > 0.5) setResolution(r - 0.05);
+    else if (miss > 0.25) auto.cap30 = true;
+  } else if (miss <= 0.01 && ++auto.clean >= 3 && r < auto.top) {
+    auto.clean = 0;
+    setResolution(r + 0.05);
+  }
+}
+function setResolution(r) {
+  quality.resolution = Math.round(r * 20) / 20;
+  resController.updateDisplay();
+  resize();
+  auto.n = -60;   // the resize hitches; let it settle
+}
+
 function loop(now) {
-  const dt = Math.min((now - last) / 1000, 0.1);
+  if (auto.cap30 && (auto.odd = !auto.odd)) { requestAnimationFrame(loop); return; }
+  const ms = now - last, dt = Math.min(ms / 1000, 0.1);
   last = now;
   if (benchmarking) { requestAnimationFrame(loop); return; }
+  if (quality.autoResolution) autoResolution(ms);
   controls.update();
   clampCamera();
   renderFrame(dt);

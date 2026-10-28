@@ -386,9 +386,11 @@ export class PostFX {
     pre.uCurve.value.set(th - knee, 2 * knee, 0.25 / knee, th);
     pre.uClamp.value = p.bloomClamp;
 
-    this._blit(this.matPre, hdrTexture, T[0], L[0]);
-    for (let i = 1; i < LEVELS; i++) this._blit(this.matDown, L[i - 1].texture, T[i], L[i]);
-    for (let i = LEVELS - 2; i >= 0; i--) this._blit(this.matUp, L[i + 1].texture, T[i + 2], L[i]);
+    if (p.bloomStrength > 0) {   // off, the composite scales the stale chain by 0
+      this._blit(this.matPre, hdrTexture, T[0], L[0]);
+      for (let i = 1; i < LEVELS; i++) this._blit(this.matDown, L[i - 1].texture, T[i], L[i]);
+      for (let i = LEVELS - 2; i >= 0; i--) this._blit(this.matUp, L[i + 1].texture, T[i + 2], L[i]);
+    }
 
     const u = this.matComp.uniforms;
     u.tHdr.value = hdrTexture;

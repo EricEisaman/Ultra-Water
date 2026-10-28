@@ -7,7 +7,7 @@ npm install
 npm run dev
 ```
 
-Open the printed localhost URL. Orbit with the mouse. Pick shots from the `camera` dropdown (they also set the sun). The `benchmark (uncapped)` button renders 300 frames back-to-back with the render loop paused and times them to GPU completion with a fence. It also runs once, 3 s after load.
+Open the printed localhost URL. Orbit with the mouse (or a finger: phones get their own profile, see [Phones and tablets](#phones-and-tablets)). Pick shots from the `camera` dropdown (they also set the sun). The `benchmark (uncapped)` button renders 300 frames back-to-back with the render loop paused and times them to GPU completion with a fence. It also runs once, 3 s after load.
 
 ## Performance
 
@@ -28,6 +28,26 @@ Per pass in Breakers: water 1.66 ms, opaque (island, rocks, props) 1.21, post 0.
 The crest-foam upgrade landed after this run. It adds three texture taps and some ALU per foam pixel only. It hasn't been re-measured cleanly yet, because another application was loading the GPU at the time.
 
 Earlier versions of this README quoted numbers 2–4× lower. Those came from a benchmark that synced with `readPixels`/`finish`, which ANGLE doesn't wait on. The fence-based benchmark is the one to trust. The HUD's GPU timer-query numbers read high while vsync-capped, because the GPU downclocks between frames.
+
+### Phones and tablets
+
+The same build spots phones and tablets (a finger as the main pointer, `matchMedia('(pointer: coarse)')`) and starts them on a lighter profile. Desktop is unchanged. Add `?mobile` or `?desktop` to the URL to force either.
+
+The mobile profile is resolution 0.6 (of the device pixel ratio, capped at 2), 2× MSAA, reflections at 0.35 scale and no bloom. On a phone the cost is mostly the number of render passes Chrome's GPU process has to translate, not pixels, so dropping bloom's 12 passes did more than lowering resolution. Auto resolution (`auto resolution` in the Quality folder) steps down by 0.05, to a floor of 0.5, when more than 4% of frames miss vsync over 2 s. It climbs back to 0.6 once frames are clean, and locks to a steady 30 fps if the floor still misses more than a quarter.
+
+Measured on a OnePlus Nord 4 (Snapdragon 7+ Gen 3, Adreno 732, Chrome 156, which runs pages at 60 Hz on it), portrait, 424×782:
+
+| Shot | live fps | missed frames | fps (uncapped) |
+|---|---|---|---|
+| Open ocean | 60 | 0% | 142 |
+| Aerial | 60 | 0% | 118 |
+| Underwater | 60 | 0% | 103 |
+| Lagoon | 60 | 0% | 102 |
+| Flotsam | 60 | 0% | 101 |
+| Golden hour | 60 | 0% | 99 |
+| Breakers | 60 | 0% | 95 |
+
+With the desktop settings (708×1304, 4× MSAA, bloom) the same phone ran 41–50 fps live, missing up to a third of its frames, and 62 fps uncapped on average. Phone numbers move with temperature. These were taken warm (thermal status 1) while charging over USB.
 
 ## What's in it
 
